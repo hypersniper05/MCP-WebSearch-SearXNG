@@ -401,6 +401,7 @@ engines:
     categories: onions
     enable_http: true
     shortcut: ah
+    disabled: true   # requires Tor; re-enable if you set up a Tor service per ADVANCED.md Tier 3
 
   - name: anaconda
     engine: xpath
@@ -778,6 +779,7 @@ engines:
     # add "list" to the array to get results in the results list
     display_type: ["infobox"]
     categories: [general]
+    disabled: true   # SearXNG 2026.4.29 wikidata init throws KeyError: 'name' — re-enable once upstream fixes it
 
   - name: duckduckgo
     engine: duckduckgo
@@ -2041,6 +2043,7 @@ engines:
     categories: onions
     enable_http: true
     shortcut: tch
+    disabled: true   # requires Tor; re-enable if you set up a Tor service per ADVANCED.md Tier 3
 
   # TubeArchivist is a self-hosted Youtube archivist software.
   # https://docs.searxng.org/dev/engines/online/tubearchivist.html
