@@ -71,8 +71,8 @@ A self-hosted SearXNG metasearch engine paired with the `mcp-searxng` MCP server
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git searxng-stack
-cd searxng-stack
+git clone https://github.com/hypersniper05/MCP-WebSearch-SearXNG.git
+cd MCP-WebSearch-SearXNG
 ```
 
 This gives you the `docker-compose.yml`, the SearXNG `settings.yml`, the MCP patches, and the custom `Dockerfile` already laid out — so the next step is straight to configuration.
@@ -81,7 +81,7 @@ This gives you the `docker-compose.yml`, the SearXNG `settings.yml`, the MCP pat
 
 ### Step 2: Configure SearXNG Settings
 
-The shipped `~/searxng-stack/searxng/config/settings.yml` is **already preconfigured** for this stack — JSON output enabled, rate limiter off, fast engine retries, a curated set of working engines (Bing, Mojeek, Yahoo, Startpage, etc.). The only thing you need to touch here is the `secret_key`.
+The shipped `searxng/config/settings.yml` is **already preconfigured** for this stack — JSON output enabled, rate limiter off, fast engine retries, a curated set of working engines (Bing, Mojeek, Yahoo, Startpage, etc.). The only thing you need to touch here is the `secret_key`.
 
 > Want to change which engines are enabled, the request timeout, or any other SearXNG default? See [**Modifying the default settings**](ADVANCED.md#modifying-the-default-settings) in ADVANCED.md.
 
@@ -127,7 +127,7 @@ For the rest of the privacy/hardening trade-offs (LAN exposure, MCP auth, Tor ro
 ### Step 3: Build and Start Everything
 
 ```bash
-cd ~/searxng-stack
+cd MCP-WebSearch-SearXNG
 docker compose build
 docker compose up -d
 ```
@@ -207,7 +207,7 @@ SearXNG is pinned to `:latest` in `docker-compose.yml`, so updates are pull-and-
 
 ### Manual update (recommended)
 ```powershell
-cd ~/searxng-stack
+cd MCP-WebSearch-SearXNG
 docker compose pull searxng        # grab newest :latest image
 docker compose up -d searxng       # recreate container with new image
 docker compose logs searxng --tail 100   # check for config-schema warnings
