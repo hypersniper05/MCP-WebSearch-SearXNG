@@ -1,0 +1,33 @@
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"   # localhost only; change to 0.0.0.0:8888:8080 for LAN access (read SECURITY notes in ADVANCED.md)
+    volumes:
+      - ./searxng/config:/etc/searxng
+      - ./searxng/data:/var/cache/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+
+  mcp-searxng:
+    build:
+      context: ./mcp-searxng-patches
+      dockerfile: Dockerfile
+    image: mcp-searxng-enhanced:latest
+    container_name: mcp-searxng
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3001:3001"
+    volumes:
+      - ./mcp-searxng-patches/index.js:/app/dist/index.js:ro
+      - ./mcp-searxng-patches/types.js:/app/dist/types.js:ro
+      - ./mcp-searxng-patches/search.js:/app/dist/search.js:ro
+      - ./mcp-searxng-patches/url-reader.js:/app/dist/url-reader.js:ro
+    environment:
+      - SEARXNG_URL=http://searxng:8080
+      - MCP_HTTP_PORT=3001
+    depends_on:
+      - searxng

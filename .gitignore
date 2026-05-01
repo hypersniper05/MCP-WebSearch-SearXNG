@@ -1,0 +1,67 @@
+# ===== Secrets & local config (NEVER commit) =====
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+secrets/
+
+# Local tooling / agent config (contains personal paths and per-machine permissions)
+.claude/
+CLAUDE.md
+.cursor/
+.aider*
+
+# Local docker-compose overrides
+docker-compose.override.yml
+docker-compose.local.yml
+
+# SearXNG local settings backups / overrides
+searxng/config/settings.yml.bak
+searxng/config/settings.local.yml
+searxng/config/*.local.yml
+
+# ===== Runtime data (regenerated; can leak query history / cache) =====
+searxng/data/
+searxng/cache/
+*.cache
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Node / build artifacts (mcp-searxng-patches) =====
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+package-lock.json.bak
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ===== IDE / editor =====
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# ===== Python (if you add tooling later) =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== Misc =====
+*.bak
+*.tmp
+*.orig
+.coverage
