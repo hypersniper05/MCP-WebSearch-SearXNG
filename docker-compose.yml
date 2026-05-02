@@ -26,12 +26,9 @@ services:
       - ./mcp-searxng-patches/types.js:/app/dist/types.js:ro
       - ./mcp-searxng-patches/search.js:/app/dist/search.js:ro
       - ./mcp-searxng-patches/url-reader.js:/app/dist/url-reader.js:ro
+      - ./mcp-searxng-patches/http-server.js:/app/dist/http-server.js:ro
     environment:
       - SEARXNG_URL=http://searxng:8080
       - MCP_HTTP_PORT=3001
-      # Hosts the MCP server will accept connections under (Host header check / DNS rebinding protection).
-      # Defaults to localhost only — add your LAN/Tailscale IP(s) here, comma-separated, if you bind to 0.0.0.0.
-      # Example: MCP_HTTP_ALLOWED_HOSTS=127.0.0.1,localhost,100.68.146.16,my-pc.tail-scale.ts.net
-      - MCP_HTTP_ALLOWED_HOSTS=${MCP_HTTP_ALLOWED_HOSTS:-127.0.0.1,localhost}
     depends_on:
       - searxng
