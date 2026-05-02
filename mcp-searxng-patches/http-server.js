@@ -5,7 +5,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { logMessage } from "./logging.js";
 import { packageVersion } from "./index.js";
-export async function createHttpServer(server) {
+// `createMcpServer` is a factory that returns a fresh MCP Server instance.
+// We MUST create a new Server per session because the MCP SDK's
+// StreamableHTTPServerTransport throws "Already connected to a transport" if
+// the same Server instance is connected to two transports.
+export async function createHttpServer(createMcpServer) {
     const app = express();
     app.use(express.json());
     // Add CORS support for web clients
@@ -14,25 +18,30 @@ export async function createHttpServer(server) {
         exposedHeaders: ['Mcp-Session-Id'],
         allowedHeaders: ['Content-Type', 'mcp-session-id'],
     }));
-    // Map to store transports by session ID  
-    const transports = {};
+    // Map sessionId -> { transport, mcpServer }. We hold the McpServer too so
+    // the GC doesn't collect it while the session is active and so we can
+    // reuse it across requests in the same session.
+    const sessions = {};
     // Handle POST requests for client-to-server communication
     app.post('/mcp', async (req, res) => {
         const sessionId = req.headers['mcp-session-id'];
         let transport;
-        if (sessionId && transports[sessionId]) {
-            // Reuse existing transport
-            transport = transports[sessionId];
-            logMessage(server, "debug", `Reusing session: ${sessionId}`);
+        let mcpServer;
+        if (sessionId && sessions[sessionId]) {
+            // Reuse existing session
+            transport = sessions[sessionId].transport;
+            mcpServer = sessions[sessionId].mcpServer;
+            logMessage(mcpServer, "debug", `Reusing session: ${sessionId}`);
         }
         else if (!sessionId && isInitializeRequest(req.body)) {
-            // New initialization request
-            logMessage(server, "info", "Creating new HTTP session");
+            // New initialization request — create fresh McpServer and transport
+            mcpServer = createMcpServer();
+            logMessage(mcpServer, "info", "Creating new HTTP session");
             transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => randomUUID(),
-                onsessioninitialized: (sessionId) => {
-                    transports[sessionId] = transport;
-                    logMessage(server, "debug", `Session initialized: ${sessionId}`);
+                onsessioninitialized: (newSessionId) => {
+                    sessions[newSessionId] = { transport, mcpServer };
+                    logMessage(mcpServer, "debug", `Session initialized: ${newSessionId}`);
                 },
                 // Explicitly disable DNS rebinding protection so this server works
                 // when reached via LAN IP, Tailscale, reverse proxy, or any non-localhost
@@ -42,15 +51,15 @@ export async function createHttpServer(server) {
                 // is the appropriate place to scope network access, not the Host header.
                 enableDnsRebindingProtection: false,
             });
-            // Clean up transport when closed
+            // Clean up session state when transport closes
             transport.onclose = () => {
                 if (transport.sessionId) {
-                    logMessage(server, "debug", `Session closed: ${transport.sessionId}`);
-                    delete transports[transport.sessionId];
+                    logMessage(mcpServer, "debug", `Session closed: ${transport.sessionId}`);
+                    delete sessions[transport.sessionId];
                 }
             };
-            // Connect the existing server to the new transport
-            await server.connect(transport);
+            // Connect THIS session's mcpServer to ITS transport
+            await mcpServer.connect(transport);
         }
         else {
             // Invalid request
@@ -93,7 +102,7 @@ export async function createHttpServer(server) {
     // Handle GET requests for server-to-client notifications via SSE
     app.get('/mcp', async (req, res) => {
         const sessionId = req.headers['mcp-session-id'];
-        if (!sessionId || !transports[sessionId]) {
+        if (!sessionId || !sessions[sessionId]) {
             console.warn(`⚠️  GET request rejected - missing or invalid session ID:`, {
                 clientIP: req.ip || req.connection.remoteAddress,
                 sessionId: sessionId || 'undefined',
@@ -102,7 +111,7 @@ export async function createHttpServer(server) {
             res.status(400).send('Invalid or missing session ID');
             return;
         }
-        const transport = transports[sessionId];
+        const transport = sessions[sessionId].transport;
         try {
             await transport.handleRequest(req, res);
         }
@@ -118,7 +127,7 @@ export async function createHttpServer(server) {
     // Handle DELETE requests for session termination
     app.delete('/mcp', async (req, res) => {
         const sessionId = req.headers['mcp-session-id'];
-        if (!sessionId || !transports[sessionId]) {
+        if (!sessionId || !sessions[sessionId]) {
             console.warn(`⚠️  DELETE request rejected - missing or invalid session ID:`, {
                 clientIP: req.ip || req.connection.remoteAddress,
                 sessionId: sessionId || 'undefined',
@@ -127,7 +136,7 @@ export async function createHttpServer(server) {
             res.status(400).send('Invalid or missing session ID');
             return;
         }
-        const transport = transports[sessionId];
+        const transport = sessions[sessionId].transport;
         try {
             await transport.handleRequest(req, res);
         }
