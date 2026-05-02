@@ -1,0 +1,22 @@
+{
+    # Auto-generate self-signed cert. No external CA, no public DNS needed.
+    auto_https disable_redirects
+}
+
+# SearXNG (web UI + JSON API on /search) — HTTPS on the same port as HTTP mode (8888)
+:8888 {
+    tls internal
+    reverse_proxy searxng:8080 {
+        # Pass through long-lived requests cleanly
+        flush_interval -1
+    }
+}
+
+# MCP server — HTTPS on the same port as HTTP mode (3001)
+:3001 {
+    tls internal
+    reverse_proxy mcp-searxng:3001 {
+        # Critical for MCP: Server-Sent Events streams must flush immediately
+        flush_interval -1
+    }
+}

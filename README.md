@@ -155,6 +155,69 @@ curl -s "http://localhost:8888/search?q=test&format=json" | head -c 200
 | MCP Server  | http://localhost:3001/mcp    | MCP Streamable HTTP        |
 | MCP Health  | http://localhost:3001/health | Health check endpoint      |
 
+> When `MCP_HTTPS=true`, all four URLs above use **`https://`** instead of `http://` — same ports, just terminated by Caddy. See the HTTPS section below.
+
+## HTTPS
+
+Some MCP clients (and most browser-based ones) refuse to talk to plain HTTP. Flip this on with one env var.
+
+### Quick start
+
+In your `.env`:
+```
+MCP_HTTPS=true
+```
+
+Then use the bundled `mcp` wrapper instead of `docker compose` (it's a one-line script that adds the right Compose overlay):
+
+```cmd
+mcp up -d         (Windows — uses mcp.cmd)
+./mcp.sh up -d    (Linux / macOS)
+```
+
+The wrapper still accepts every `docker compose` subcommand: `mcp logs -f`, `mcp down`, `mcp restart`, etc.
+
+### What happens when HTTPS is on
+
+- A **Caddy** reverse-proxy container is added to the stack
+- It auto-generates a self-signed certificate on first start (Caddy's `tls internal`)
+- The same ports (`8888` and `3001`) keep serving — only the protocol flips to HTTPS
+- The underlying SearXNG and MCP containers stop publishing host ports directly; only Caddy is reachable from outside
+
+### Trusting the self-signed cert
+
+Caddy's auto-generated cert is signed by a local root CA Caddy creates on first start. Each client machine that wants to reach this server needs that root CA in its trust store **once**.
+
+Extract it from the running Caddy container:
+```cmd
+docker exec mcp-caddy cat /data/caddy/pki/authorities/local/root.crt > caddy-root.crt
+```
+
+Install the resulting `caddy-root.crt`:
+- **Windows**: double-click → "Install Certificate" → "Local Machine" → "Trusted Root Certification Authorities"
+- **macOS**: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain caddy-root.crt`
+- **Linux**: copy to `/usr/local/share/ca-certificates/` then `sudo update-ca-certificates`
+
+After that, browsers, `curl`, and most MCP clients trust the cert without warnings.
+
+### Easier alternative for Tailscale users
+
+If your only consumer is a machine on your Tailscale tailnet, **Tailscale Serve** gives you a real, fully-trusted cert with **zero** install steps on the client side:
+
+```cmd
+tailscale serve https / http://localhost:3001
+tailscale cert
+```
+
+Your MCP URL then becomes `https://<machine>.<tailnet>.ts.net/mcp` — accepted out of the box by every client. This is set up entirely outside this project (just on your host's Tailscale install) and doesn't conflict with anything in this repo.
+
+### When you don't need HTTPS
+
+If you're calling the MCP server from another container on the **same** machine, or from native code on the same host, plain HTTP is fine and skips all of the above. HTTPS is only needed when:
+- The client is in a browser context that blocks mixed content
+- A specific MCP client requires `https://` URLs
+- You're crossing a network you don't fully trust (and Tailscale isn't an option)
+
 ## MCP Tools
 
 ### 1. searxng_web_search
