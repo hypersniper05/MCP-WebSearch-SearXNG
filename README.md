@@ -124,26 +124,80 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 For the rest of the privacy/hardening trade-offs (LAN exposure, MCP auth, Tor routing), see **[ADVANCED.md](ADVANCED.md)**.
 
-### Step 3: Build and Start Everything
+### Step 3 (optional): Enable HTTPS
 
+Skip this step if HTTP is fine for your use case (typical for localhost-only or same-machine usage). Do this step if your MCP client refuses plain HTTP (most browser-based clients), if you're crossing an untrusted network, or if you just prefer TLS.
+
+In your `.env`, set:
+```
+MCP_HTTPS=true
+```
+
+That's it for the toggle. When you bring the stack up in the next step, **use the bundled `mcp` wrapper instead of `docker compose`** — it reads `MCP_HTTPS` and adds the right Compose overlay automatically:
+
+```cmd
+mcp up -d         (Windows — uses mcp.cmd)
+./mcp.sh up -d    (Linux / macOS)
+```
+
+The wrapper accepts every `docker compose` subcommand (`mcp logs -f`, `mcp down`, `mcp restart`, etc.).
+
+When HTTPS is on:
+- A **Caddy** reverse-proxy container is added that auto-generates a self-signed cert
+- Same ports stay in use (`8888` and `3001`) — only the protocol flips from `http://` to `https://`
+- The underlying SearXNG and MCP containers stop publishing host ports directly; only Caddy is reachable from outside
+
+**One-time per client machine: trust the self-signed cert** (otherwise browsers and most clients refuse the connection). After Step 4 brings Caddy up:
+
+```cmd
+docker exec mcp-caddy cat /data/caddy/pki/authorities/local/root.crt > caddy-root.crt
+```
+
+Then install `caddy-root.crt`:
+- **Windows**: double-click → "Install Certificate" → "Local Machine" → "Trusted Root Certification Authorities"
+- **macOS**: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain caddy-root.crt`
+- **Linux**: copy to `/usr/local/share/ca-certificates/` then `sudo update-ca-certificates`
+
+> **Already on Tailscale?** Skip Caddy entirely and use **Tailscale Serve** for a real, fully-trusted cert with zero client install steps. See the [HTTPS section](#https) below.
+
+### Step 4: Build and Start Everything
+
+If HTTPS is **off** (default):
 ```bash
-cd MCP-WebSearch-SearXNG
 docker compose build
 docker compose up -d
 ```
 
-### Step 4: Verify Services
+If HTTPS is **on** (Step 3 enabled):
+```cmd
+mcp build         REM Windows
+mcp up -d
+```
+```bash
+./mcp.sh build    # Linux / macOS
+./mcp.sh up -d
+```
+
+### Step 5: Verify Services
 
 Health check:
 ```bash
+# HTTP mode (default)
 curl -s http://localhost:3001/health
+
+# HTTPS mode (after trusting the cert; use -k to skip verification for a quick smoke test)
+curl -s https://localhost:3001/health
 ```
 
 Expected: `{"status":"healthy","server":"ihor-sokoliuk/mcp-searxng","version":"0.9.2-enhanced","transport":"http"}`
 
 Test search:
 ```bash
+# HTTP
 curl -s "http://localhost:8888/search?q=test&format=json" | head -c 200
+
+# HTTPS
+curl -s "https://localhost:8888/search?q=test&format=json" | head -c 200
 ```
 
 ## Endpoints Summary
