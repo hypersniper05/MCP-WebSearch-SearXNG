@@ -1,27 +1,15 @@
 {
-    # Auto-generate self-signed cert. No external CA, no public DNS needed.
-    auto_https disable_redirects
-    # Required to allow Caddy to issue internal certs for any hostname/IP on
-    # demand (LAN IP, Tailscale IP, localhost, container name, etc.) without
-    # listing them up front.
-    on_demand_tls {
-        # Permit any host — internal CA only signs for the requested SNI.
-        # Safe with `tls internal` because no public CA / Let's Encrypt is involved.
-        ask http://localhost:2020/check
-    }
+    # No auto Let's Encrypt; we use the internal CA only.
+    auto_https off
 }
 
-# Tiny always-OK endpoint that on_demand_tls calls before issuing a cert.
-:2020 {
-    respond /check 200
-}
-
-# SearXNG (web UI + JSON API on /search) — HTTPS on the same port as HTTP mode (8888)
-:8888 {
-    tls {
-        issuer internal
-        on_demand
-    }
+# SearXNG (web UI + JSON API on /search) — HTTPS on the same port as HTTP mode (8888).
+# Bind explicitly to the internal CA via `tls internal`. The wildcard
+# https://* matcher with tls internal lets Caddy issue a cert for whatever
+# SNI the client presents (localhost, 127.0.0.1, LAN IP, Tailscale IP, etc.)
+# at request time — no upfront list needed.
+https://:8888 {
+    tls internal
     reverse_proxy searxng:8080 {
         # Pass through long-lived requests cleanly
         flush_interval -1
@@ -29,11 +17,8 @@
 }
 
 # MCP server — HTTPS on the same port as HTTP mode (3001)
-:3001 {
-    tls {
-        issuer internal
-        on_demand
-    }
+https://:3001 {
+    tls internal
     reverse_proxy mcp-searxng:3001 {
         # Critical for MCP: Server-Sent Events streams must flush immediately
         flush_interval -1
