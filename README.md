@@ -145,6 +145,55 @@ Test search:
 curl -s "http://localhost:8888/search?q=test&format=json" | head -c 200
 ```
 
+### Step 5 (only if accessing from another machine): Open the bindings to your LAN / Tailscale
+
+By default the shipped `docker-compose.yml` binds the services to **`127.0.0.1`** — reachable only from the machine running Docker. If you want another device on your LAN, your Tailscale tailnet, or anywhere else off-host to reach the SearXNG UI or the MCP endpoint, you have to change the bindings to **`0.0.0.0`**.
+
+Quick diagnostic to spot this:
+
+```cmd
+docker compose ps
+```
+
+Look at the **PORTS** column. If you see:
+
+| What you see | What it means |
+|---|---|
+| `0.0.0.0:8888->8080/tcp` | Reachable from anywhere on the network ✓ |
+| `127.0.0.1:8888->8080/tcp` | **Localhost only** — the *exact* symptom that makes external access "time out" |
+
+If both rows show `127.0.0.1:` (or one does and one doesn't, like SearXNG locked down while MCP is open), edit `docker-compose.yml` and change the binding(s):
+
+```yaml
+services:
+  searxng:
+    ports:
+      - "0.0.0.0:8888:8080"   # was 127.0.0.1:8888:8080
+
+  mcp-searxng:
+    ports:
+      - "0.0.0.0:3001:3001"   # was 127.0.0.1:3001:3001
+```
+
+Then a **full down + up** is required (port changes don't apply on a plain `restart`):
+
+```cmd
+docker compose down
+docker compose up -d
+docker compose ps
+```
+
+Both rows should now show `0.0.0.0:...`.
+
+If `docker compose ps` already shows `0.0.0.0` and external access *still* fails, it's the OS firewall. On Windows, allow the ports from an admin PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "MCP SearXNG (8888)" -Direction Inbound -Protocol TCP -LocalPort 8888 -Action Allow
+New-NetFirewallRule -DisplayName "MCP Server (3001)"   -Direction Inbound -Protocol TCP -LocalPort 3001 -Action Allow
+```
+
+> **Security note**: switching to `0.0.0.0` exposes the services to anyone who can reach your machine on those ports. The MCP server has no authentication. If you're going beyond a trusted home/Tailscale network, read [ADVANCED.md → Tier 2](ADVANCED.md#tier-2--network-hardening) for adding a reverse proxy with auth.
+
 ## Endpoints Summary
 
 | Service     | URL                          | Purpose                    |
