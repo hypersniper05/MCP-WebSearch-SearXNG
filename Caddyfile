@@ -1,15 +1,28 @@
 {
     # No auto Let's Encrypt; we use the internal CA only.
     auto_https off
+
+    # Required so the on_demand directive in site blocks can mint certs for
+    # arbitrary SNI values (LAN IP, Tailscale IP, container name, anything).
+    # The check endpoint always returns 200 because we're only issuing internal
+    # CA certs — no Let's Encrypt rate limits to abuse.
+    on_demand_tls {
+        ask http://localhost:2020/check
+    }
+}
+
+# Always-OK endpoint that on_demand_tls calls before issuing each cert.
+# Marked HTTP-only so Caddy doesn't try to wrap it in TLS.
+http://:2020 {
+    respond /check 200
 }
 
 # SearXNG (web UI + JSON API on /search) — HTTPS on the same port as HTTP mode (8888).
-# Bind explicitly to the internal CA via `tls internal`. The wildcard
-# https://* matcher with tls internal lets Caddy issue a cert for whatever
-# SNI the client presents (localhost, 127.0.0.1, LAN IP, Tailscale IP, etc.)
-# at request time — no upfront list needed.
-https://:8888 {
-    tls internal
+:8888 {
+    tls {
+        issuer internal
+        on_demand
+    }
     reverse_proxy searxng:8080 {
         # Pass through long-lived requests cleanly
         flush_interval -1
@@ -17,8 +30,11 @@ https://:8888 {
 }
 
 # MCP server — HTTPS on the same port as HTTP mode (3001)
-https://:3001 {
-    tls internal
+:3001 {
+    tls {
+        issuer internal
+        on_demand
+    }
     reverse_proxy mcp-searxng:3001 {
         # Critical for MCP: Server-Sent Events streams must flush immediately
         flush_interval -1
