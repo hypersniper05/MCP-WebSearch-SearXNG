@@ -5,6 +5,6 @@ FROM isokoliuk/mcp-searxng:latest
 # then remove npm again to keep the resulting image lean.
 USER root
 RUN apk add --no-cache npm \
-    && cd /app && npm install --omit=dev sharp@0.33.5 \
+    && cd /app && npm install --omit=dev sharp@0.33.5 @tavily/core \
     && apk del npm \
     && rm -rf /root/.npm /tmp/*

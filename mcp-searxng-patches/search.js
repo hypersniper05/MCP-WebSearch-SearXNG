@@ -1,3 +1,4 @@
+import { tavily } from "@tavily/core";
 import { createProxyAgent } from "./proxy.js";
 import { logMessage } from "./logging.js";
 import { createConfigurationError, createNetworkError, createServerError, createJSONError, createDataError, createNoResultsMessage } from "./error-handler.js";
@@ -210,6 +211,50 @@ export async function performWebSearch(server, query, pageno = 1, time_range, la
 
     const duration = Date.now() - startTime;
     logMessage(server, "info", `Search completed: "${query}" (${searchParams}) - ${output.results.length} results in ${duration}ms`);
+    output.search_time_ms = duration;
+
+    return JSON.stringify(output, null, 2);
+}
+
+export async function performTavilySearch(server, query, max_results = 10, topic = "general") {
+    const startTime = Date.now();
+    logMessage(server, "info", `Starting Tavily search: "${query}" (topic: ${topic}, max: ${max_results})`);
+
+    const apiKey = process.env.TAVILY_API_KEY;
+    if (!apiKey) {
+        logMessage(server, "error", "TAVILY_API_KEY not configured");
+        throw createConfigurationError("TAVILY_API_KEY not set. Set it to your Tavily API key to enable Tavily search.");
+    }
+
+    const tvly = tavily({ apiKey });
+
+    let response;
+    try {
+        response = await tvly.search(query, {
+            maxResults: Math.min(max_results, 20),
+            topic,
+        });
+    } catch (error) {
+        logMessage(server, "error", `Tavily search error: ${error.message}`, { query });
+        throw new Error(`Tavily search failed: ${error.message}`);
+    }
+
+    const output = {
+        query: response.query || query,
+        results: (response.results || []).map(r => ({
+            title: r.title || "",
+            url: r.url || "",
+            description: r.content || "",
+            score: r.score || 0,
+        })),
+    };
+
+    if (response.answer) {
+        output.answer = response.answer;
+    }
+
+    const duration = Date.now() - startTime;
+    logMessage(server, "info", `Tavily search completed: "${query}" - ${output.results.length} results in ${duration}ms`);
     output.search_time_ms = duration;
 
     return JSON.stringify(output, null, 2);

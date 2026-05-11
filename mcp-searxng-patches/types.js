@@ -89,6 +89,51 @@ export const WEB_SEARCH_TOOL = {
         required: ["query"],
     },
 };
+export function isTavilyWebSearchArgs(args) {
+    return (typeof args === "object" &&
+        args !== null &&
+        "query" in args &&
+        typeof args.query === "string");
+}
+export const TAVILY_WEB_SEARCH_TOOL = {
+    name: "tavily_web_search",
+    description:
+        "Search the web using the Tavily API, optimized for LLM consumption. Returns structured JSON with results and optional AI-generated answers.\n\n" +
+        "## Topics\n" +
+        "- 'general' (default) — broad web search\n" +
+        "- 'news' — recent news articles\n" +
+        "- 'finance' — financial data and news\n\n" +
+        "## Tips\n" +
+        "- Returns relevance-scored results with title, URL, and description\n" +
+        "- Use max_results to control the number of results (1-20)",
+    annotations: {
+        readOnlyHint: true,
+        openWorldHint: true,
+    },
+    inputSchema: {
+        type: "object",
+        properties: {
+            query: {
+                type: "string",
+                description: "Search query string (max 400 characters).",
+            },
+            max_results: {
+                type: "number",
+                description: "Maximum number of results to return (1-20). Default: 10.",
+                minimum: 1,
+                maximum: 20,
+                default: 10,
+            },
+            topic: {
+                type: "string",
+                description: "Search topic. Options: general, news, finance. Default: general.",
+                enum: ["general", "news", "finance"],
+                default: "general",
+            },
+        },
+        required: ["query"],
+    },
+};
 export const READ_URL_TOOL = {
     name: "web_url_read",
     description:
