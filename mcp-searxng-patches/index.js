@@ -2,9 +2,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, SetLevelRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ReadResourceRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import { WEB_SEARCH_TOOL, READ_URL_TOOL, isSearXNGWebSearchArgs } from "./types.js";
+import { WEB_SEARCH_TOOL, READ_URL_TOOL, isSearXNGWebSearchArgs, TAVILY_WEB_SEARCH_TOOL, isTavilyWebSearchArgs } from "./types.js";
 import { logMessage, setLogLevel } from "./logging.js";
-import { performWebSearch } from "./search.js";
+import { performWebSearch, performTavilySearch } from "./search.js";
 import { fetchAndConvertToMarkdown, fetchImage } from "./url-reader.js";
 import { createConfigResource, createHelpResource } from "./resources.js";
 import { createHttpServer } from "./http-server.js";
@@ -63,6 +63,25 @@ export function isWebUrlReadArgs(args) {
 // per HTTP session (otherwise: "Already connected to a transport" error).
 // stdio transport uses a single server, but it goes through the same factory.
 function createMcpServer() {
+    const tavilyEnabled = !!process.env.TAVILY_API_KEY;
+
+    const toolsCap = {
+        searxng_web_search: {
+            description: WEB_SEARCH_TOOL.description,
+            schema: WEB_SEARCH_TOOL.inputSchema,
+        },
+        web_url_read: {
+            description: READ_URL_TOOL.description,
+            schema: READ_URL_TOOL.inputSchema,
+        },
+    };
+    if (tavilyEnabled) {
+        toolsCap.tavily_web_search = {
+            description: TAVILY_WEB_SEARCH_TOOL.description,
+            schema: TAVILY_WEB_SEARCH_TOOL.inputSchema,
+        };
+    }
+
     const server = new Server({
         name: "ihor-sokoliuk/mcp-searxng",
         version: packageVersion,
@@ -70,24 +89,17 @@ function createMcpServer() {
         capabilities: {
             logging: {},
             resources: {},
-            tools: {
-                searxng_web_search: {
-                    description: WEB_SEARCH_TOOL.description,
-                    schema: WEB_SEARCH_TOOL.inputSchema,
-                },
-                web_url_read: {
-                    description: READ_URL_TOOL.description,
-                    schema: READ_URL_TOOL.inputSchema,
-                },
-            },
+            tools: toolsCap,
         },
     });
 
     server.setRequestHandler(ListToolsRequestSchema, async () => {
         logMessage(server, "debug", "Handling list_tools request");
-        return {
-            tools: [WEB_SEARCH_TOOL, READ_URL_TOOL],
-        };
+        const tools = [WEB_SEARCH_TOOL, READ_URL_TOOL];
+        if (tavilyEnabled) {
+            tools.push(TAVILY_WEB_SEARCH_TOOL);
+        }
+        return { tools };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -126,6 +138,15 @@ function createMcpServer() {
                 };
                 return {
                     content: [{ type: "text", text: JSON.stringify(combined, null, 2) }],
+                };
+            }
+            else if (name === "tavily_web_search" && tavilyEnabled) {
+                if (!isTavilyWebSearchArgs(args)) {
+                    throw new Error("Invalid arguments for Tavily web search");
+                }
+                const result = await performTavilySearch(server, args.query, args.max_results, args.topic);
+                return {
+                    content: [{ type: "text", text: result }],
                 };
             }
             else if (name === "web_url_read") {
