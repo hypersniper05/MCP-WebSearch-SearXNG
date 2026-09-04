@@ -15,6 +15,27 @@ export { packageVersion };
 
 let currentLogLevel = "info";
 
+// Multi-query searches used to fan out with an unbounded Promise.all. Each
+// query hits every engine in the category at once, so N queries meant N
+// simultaneous requests per engine from a single IP -- enough to trip rate
+// limits and exhaust SearXNG's outgoing connection pool, which then surfaces
+// as engine timeouts. Run them a couple at a time instead.
+const MAX_CONCURRENT_QUERIES = 2;
+
+async function mapWithConcurrency(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (true) {
+            const i = next++;
+            if (i >= items.length) return;
+            results[i] = await fn(items[i], i);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+
 // Image extensions for URL detection
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico', '.tiff', '.avif'];
 
@@ -112,9 +133,9 @@ function createMcpServer() {
                     };
                 }
 
-                // Multiple queries — run in parallel and combine
-                const results = await Promise.all(
-                    queries.map(q => performWebSearch(server, q, args.pageno, args.time_range, args.language, args.safesearch, args.categories, args.max_results, args.offset))
+                // Multiple queries — run a few at a time and combine
+                const results = await mapWithConcurrency(queries, MAX_CONCURRENT_QUERIES, q =>
+                    performWebSearch(server, q, args.pageno, args.time_range, args.language, args.safesearch, args.categories, args.max_results, args.offset)
                 );
                 const combined = {
                     multi_query: true,
@@ -255,7 +276,7 @@ function createMcpServer() {
     return server;
 }
 
-async function main() {
+export async function main() {
     const validationError = validateEnv();
     if (validationError) {
         console.error(`\u274C ${validationError}`);
@@ -312,7 +333,6 @@ process.on('unhandledRejection', (reason, promise) => {
     process.exit(1);
 });
 
-main().catch((error) => {
-    console.error("Failed to start server:", error);
-    process.exit(1);
-});
+// dist/cli.js is the image entrypoint: it imports this module and calls
+// main() itself. Invoking main() here as well would start the server twice
+// and fail with "Already connected to a transport", so it is only exported.
