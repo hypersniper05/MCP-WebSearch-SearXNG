@@ -61,11 +61,16 @@ search:
   suspended_times:
     # Engine suspension time after error (in seconds; set to 0 to disable)
     # For error "Access denied" and "HTTP error [402, 403]"
-    SearxEngineAccessDenied: 30
+    # These were previously 30/60/30. That retried blocked engines on almost
+    # every query, so each search paid the full request timeout waiting on
+    # engines that were certain to fail, and the repeated hits kept the
+    # instance flagged. Longer holds make searches faster and let an engine's
+    # reputation recover.
+    SearxEngineAccessDenied: 900
     # For error "CAPTCHA"
-    SearxEngineCaptcha: 60
+    SearxEngineCaptcha: 1800
     # For error "Too many request" and "HTTP error 429"
-    SearxEngineTooManyRequests: 30
+    SearxEngineTooManyRequests: 900
     # Cloudflare CAPTCHA
     cf_SearxEngineCaptcha: 1296000
     cf_SearxEngineAccessDenied: 86400
@@ -184,7 +189,7 @@ outgoing:
   # point.
   pool_maxsize: 20
   # See https://www.python-httpx.org/http2/
-  enable_http2: true
+  enable_http2: false
   # uncomment below section if you want to use a custom server certificate
   # see https://www.python-httpx.org/advanced/#changing-the-verification-defaults
   # and https://www.python-httpx.org/compatibility/#ssl-configuration
@@ -660,7 +665,7 @@ engines:
     categories: general
     search_type: web
     timeout: 5.0
-    disabled: true
+    disabled: true   # returns HTTP 403 'access denied' from self-hosted instances
 
   - name: yep images
     engine: yep
@@ -1395,7 +1400,11 @@ engines:
     engine: mwmbl
     # api_url: https://api.mwmbl.org
     shortcut: mwm
-    disabled: true
+    # One of the few general engines that still answers this instance, and the
+    # largest contributor by result count, but it regularly needs more than the
+    # 5.0s global timeout.
+    timeout: 7.0
+    disabled: false
 
   - name: niconico
     engine: niconico
@@ -1647,6 +1656,7 @@ engines:
   - name: podcastindex
     engine: podcastindex
     shortcut: podcast
+    disabled: true   # engine module removed from SearXNG image
 
   # Required dependency: psychopg2
   #  - name: postgresql
@@ -1664,7 +1674,7 @@ engines:
     categories: [general, web]
     shortcut: ps
     timeout: 5.0
-    disabled: false
+    disabled: true   # engine module removed from SearXNG image
 
   - name: presearch images
     engine: presearch
@@ -1673,7 +1683,7 @@ engines:
     categories: [images, web]
     timeout: 5.0
     shortcut: psimg
-    disabled: false
+    disabled: true   # engine module removed from SearXNG image
 
   - name: presearch videos
     engine: presearch
@@ -1682,7 +1692,7 @@ engines:
     categories: [general, web]
     timeout: 5.0
     shortcut: psvid
-    disabled: false
+    disabled: true   # engine module removed from SearXNG image
 
   - name: presearch news
     engine: presearch
@@ -1691,7 +1701,7 @@ engines:
     categories: [news, web]
     timeout: 5.0
     shortcut: psnews
-    disabled: false
+    disabled: true   # engine module removed from SearXNG image
 
   - name: pub.dev
     engine: xpath
@@ -2328,7 +2338,7 @@ engines:
   - name: seznam
     shortcut: szn
     engine: seznam
-    disabled: true
+    disabled: false
 
   - name: deepl
     engine: deepl
@@ -2343,6 +2353,15 @@ engines:
     shortcut: mjk
     engine: mojeek
     categories: [general, web]
+    disabled: false
+
+  - name: swisscows
+    engine: swisscows
+    shortcut: sw
+    categories: [general, web]
+    # The engine refuses to register without this: it caps web results at 20 and
+    # errors out on the higher instance-wide default.
+    results_per_page: 20
     disabled: false
 
   - name: mojeek images

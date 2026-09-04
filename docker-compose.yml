@@ -8,9 +8,17 @@ services:
     volumes:
       - ./searxng/config:/etc/searxng
       - ./searxng/data:/var/cache/searxng
+      # Patched engine: upstream sends an empty `iscqry=` param that Yahoo now
+      # answers with HTTP 500. Re-copy from the image after a SearXNG upgrade.
+      - ./searxng-patches/yahoo.py:/usr/local/searxng/searx/engines/yahoo.py:ro
     environment:
       - SEARXNG_BASE_URL=http://localhost:8888/
       - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+      # The image ships a precompiled __pycache__ next to the engine sources.
+      # Without this, some workers load the stale yahoo.pyc instead of the
+      # patched yahoo.py above and the engine fails intermittently. Sending the
+      # bytecode cache elsewhere makes every worker compile the mounted source.
+      - PYTHONPYCACHEPREFIX=/tmp/pycache
 
   mcp-searxng:
     build:
