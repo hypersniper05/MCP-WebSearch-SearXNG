@@ -25,6 +25,12 @@ services:
       context: ./mcp-searxng-patches
       dockerfile: Dockerfile
     image: mcp-searxng-enhanced:latest
+    # Without this, `docker compose up -d` happily reuses whatever image is
+    # already tagged mcp-searxng-enhanced:latest and never rebuilds, so a
+    # changed Dockerfile (e.g. a new pinned base) silently does nothing.
+    # Note this still only refreshes the IMAGE -- use `up -d --force-recreate`
+    # to move the running container onto it.
+    pull_policy: build
     container_name: mcp-searxng
     restart: unless-stopped
     ports:

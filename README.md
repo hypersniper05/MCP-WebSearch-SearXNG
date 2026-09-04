@@ -283,10 +283,35 @@ Updates then become an explicit edit — review release notes, bump tag, `docker
 A reasonable middle ground: schedule a weekly job that runs `docker compose pull` and reports whether a new image is available, but does not auto-apply it.
 
 ### Updating the MCP server
-`mcp-searxng` is built locally from `mcp-searxng-patches/Dockerfile` (base: `isokoliuk/mcp-searxng:latest`) with custom JS patches mounted on top. To pull upstream MCP changes:
-1. `docker compose build --pull mcp-searxng` — rebuilds from a freshly pulled base image
-2. `docker compose up -d mcp-searxng` — recreates the container
-3. Verify the patches in `mcp-searxng-patches/*.js` still apply cleanly against any upstream API changes (check `docker compose logs mcp-searxng` for errors)
+`mcp-searxng` is built locally from `mcp-searxng-patches/Dockerfile` with custom JS patches
+mounted on top. The base image is **pinned** to `isokoliuk/mcp-searxng:1.16.0` — see the
+comment in that Dockerfile before changing it.
+
+After pulling this repo on another machine, or to pick up upstream MCP changes:
+
+```bash
+docker compose build --pull mcp-searxng
+docker compose up -d --force-recreate mcp-searxng
+```
+
+`--force-recreate` is not optional. A plain `docker compose up -d` rebuilds the image but
+leaves the existing container running on the **old** image, so the update silently does
+nothing. Symptom: the container crash-loops with
+`ERR_MODULE_NOT_FOUND: Cannot find package '@modelcontextprotocol/sdk'` while SearXNG
+itself keeps working fine.
+
+Confirm the container is actually on a freshly built image — these two ids must match:
+
+```bash
+docker inspect mcp-searxng --format '{{.Image}}' && docker images --no-trunc --format '{{.ID}}' mcp-searxng-enhanced:latest
+```
+
+And confirm which base it was built on. `sdk` is correct; `core node server` means the
+image is stale and still on the 2.x base:
+
+```bash
+docker run --rm --entrypoint sh mcp-searxng-enhanced:latest -c "ls /app/node_modules/@modelcontextprotocol/"
+```
 
 If upstream renames internal modules or changes function signatures, the volume-mounted JS patches may need to be rebased manually.
 
