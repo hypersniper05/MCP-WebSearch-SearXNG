@@ -81,7 +81,7 @@ This gives you the `docker-compose.yml`, the SearXNG `settings.yml`, the MCP pat
 
 ### Step 2: Configure SearXNG Settings
 
-The shipped `searxng/config/settings.yml` is **already preconfigured** for this stack — JSON output enabled, rate limiter off, fast engine retries, a curated set of working engines (Bing, Mojeek, Yahoo, Startpage, etc.). The only thing you need to touch here is the `secret_key`.
+The shipped `searxng/config/settings.yml` is **already preconfigured** for this stack — JSON output enabled, rate limiter off, fast engine retries, a curated set of engines, and engine suspension times tuned so a blocked engine is not retried on every single query. The only thing you need to touch here is the `secret_key`.
 
 > Want to change which engines are enabled, the request timeout, or any other SearXNG default? See [**Modifying the default settings**](ADVANCED.md#modifying-the-default-settings) in ADVANCED.md.
 
@@ -298,4 +298,21 @@ If upstream renames internal modules or changes function signatures, the volume-
 - SearXNG connects internally via Docker hostname `searxng:8080`
 - All data stays local — no external API keys needed
 - Custom patches are MIT-licensed, audited, no filesystem/shell access, no telemetry
-- Search engines: Bing, Startpage, Mojeek, Yahoo active; Google with mobile UI (may intermittently block)
+- Search engines: Bing, Yahoo, mwmbl, Seznam and Wiby are the general-web
+  engines enabled by default, plus Wikipedia and WolframAlpha for direct
+  answers. Brave, DuckDuckGo, Startpage and Mojeek stay configured but are
+  frequently blocked — see below.
+- **If results look thin, it is usually your exit IP, not this stack.** Brave
+  (HTTP 429), DuckDuckGo and Startpage (CAPTCHA), Mojeek (empty result page)
+  and Ecosia (HTTP 403) all reject self-hosted instances on shared or flagged
+  addresses — VPN exits, CGNAT and datacenter ranges are the common causes.
+  Every one of them fails on the very first query from a cold container, so it
+  is not a rate-limiting problem you can tune your way out of. Check what
+  SearXNG reports:
+  ```bash
+  curl -s "http://localhost:8888/search?q=test&format=json" | jq .unresponsive_engines
+  ```
+  Options, roughly in order of effort: search from a residential IP without a
+  VPN, put the outgoing requests behind proxies (`outgoing.proxies` in
+  `searxng/config/settings.yml`), or supply an API key for an engine that sells
+  one (`braveapi`). Adding more blocked engines does not help.
