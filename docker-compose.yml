@@ -4,7 +4,11 @@ services:
     container_name: searxng
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8888:8080"   # localhost only; change to 0.0.0.0:8888:8080 for LAN access (read SECURITY notes in ADVANCED.md)
+      # Defaults to localhost only. For LAN/Tailscale access set SEARXNG_BIND=0.0.0.0
+      # in .env rather than editing this line -- .env is gitignored, so the binding
+      # survives `git pull` instead of conflicting with it. Read the SECURITY notes
+      # in ADVANCED.md before exposing this, and set SEARXNG_SECRET.
+      - "${SEARXNG_BIND:-127.0.0.1}:8888:8080"
     volumes:
       - ./searxng/config:/etc/searxng
       - ./searxng/data:/var/cache/searxng
@@ -34,7 +38,9 @@ services:
     container_name: mcp-searxng
     restart: unless-stopped
     ports:
-      - "0.0.0.0:3001:3001"
+      # Reachable off-box by default so remote MCP clients can connect. Set
+      # MCP_BIND=127.0.0.1 in .env to restrict it to this machine.
+      - "${MCP_BIND:-0.0.0.0}:3001:3001"
     volumes:
       - ./mcp-searxng-patches/index.js:/app/dist/index.js:ro
       - ./mcp-searxng-patches/types.js:/app/dist/types.js:ro
