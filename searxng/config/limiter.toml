@@ -1,0 +1,2 @@
+# Limiter is off (server.limiter: false in settings.yml). This file only exists
+# so SearXNG does not log "missing config file: /etc/searxng/limiter.toml".
