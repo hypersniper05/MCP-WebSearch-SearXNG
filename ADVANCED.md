@@ -19,22 +19,27 @@ This stack is privacy-respecting in design but is **not anonymous out of the box
 | Protection | How it's enforced |
 |---|---|
 | **Zero telemetry** — no phone-home, ever | No Sentry / PostHog / Datadog / Google Analytics in the MCP patches; SearXNG sends no usage stats |
-| **No user state** — nothing tied to you | No accounts, no search history, no per-user logging to disk |
+| **No user state** — nothing tied to you | No accounts, no search history, no per-user logging. Note that SearXNG's engine error warnings include the full request URL, search terms included, and Docker keeps container logs on disk (`docker compose logs searxng`) |
 | **No autocomplete keystroke streaming** | `autocomplete: ""` — your typing never reaches a third-party suggestion service |
-| **Queries stay out of browser history** | `query_in_title: false` — your search terms don't appear in the page title |
-| **Tracking params stripped from results** | `tracker_url_remover` plugin removes `utm_*`, `fbclid`, `gclid`, etc. before showing you the link |
+| **Queries stay out of the page title** | `query_in_title: false` (upstream default) — your search terms don't appear in the tab title. They are still in the URL (`/search?q=...`, because `server.method` defaults to `GET`) and so in browser history; set `server: method: "POST"` in `settings.yml` to keep them out |
 | **No cookies, no auth headers, no API keys** | The stack works fully without any third-party credentials |
-| **All data is local** | Lives in Docker volumes on your machine — nothing syncs to a cloud |
+| **`web_url_read` cannot reach your private network** | Upstream's URL guard refuses localhost, LAN, Tailscale, link-local and Docker addresses on every request and every redirect, for pages and images alike |
+| **Image reads cannot exhaust memory** | 100-megapixel decode cap, at most 2 raster resizes and 2 SVG renders at a time, SVGs rendered in a child process with a 10 s and 2 GB limit, and a 4 GB cap on the MCP container |
+| **MCP server runs unprivileged** | The container runs as uid 1000, not root |
+| **All data is local** | Lives in folders next to `docker-compose.yml` (`searxng/config`, `searxng/data`) and in the MCP server's in-memory caches — nothing syncs to a cloud |
+
+> The `tracker_url_remover` plugin (strips `utm_*`, `fbclid`, `gclid` from result links) is **off**: it scans a SQLite table per URL and, under concurrent engine responses, made image searches take 4-5 s and time engines out. Turn it back on under `plugins:` in `settings.yml` if you use the web UI and care more about clean links than speed.
 
 ## Residual exposure (what still leaks by default)
 
 | Leak | Why it happens | Fix |
 |---|---|---|
-| **Your IP reaches upstream engines** | SearXNG queries Bing / Yahoo / Mojeek / etc. from your machine's IP. They can't see *who* you are, but they see *where* the query came from | Route SearXNG through Tor or a VPN — see Tier 3 |
+| **Your IP reaches upstream engines** | SearXNG queries Bing / Yahoo / Yandex / etc. from your machine's IP. They can't see *who* you are, but they see *where* the query came from | Route SearXNG through Tor or a VPN — see Tier 3 |
+| **Some engines are third-party proxies** | `findborg` relays general queries to Brave's index through findborg.com, and `lingva` (used only for translation queries such as `en-de word`) relays them to Google Translate through lingva.ml, so those services see your queries too | Set `inactive: true` on `findborg` (and `lingva`) in `settings.yml` |
 | **`web_url_read` reveals your IP to the target site** | Same as opening the page in a normal browser | Same proxy treatment for the MCP container — Tier 3 |
-| **Services are reachable from your LAN** | `docker-compose.yml` binds ports `8888` and `3001` to `0.0.0.0` — anyone on your network can hit them | Bind to `127.0.0.1` — Tier 1 |
-| **No authentication on the MCP endpoint** | Anything that can reach `:3001/mcp` can use it; the server itself has no auth | Put a reverse proxy with auth in front — Tier 2 |
-| **Prometheus metrics endpoint is on** | `enable_metrics: true` exposes performance counters at `/stats`. Not user data, but extra attack surface | Disable in `settings.yml` — Tier 2 |
+| **The MCP endpoint is reachable from your LAN** | `docker-compose.yml` binds `3001` to `0.0.0.0` by default (SearXNG's `8888` defaults to `127.0.0.1`) — anyone on your network can use it | `MCP_BIND=127.0.0.1` in `.env` — Tier 1 |
+| **No authentication on the MCP endpoint** | Anything that can reach `:3001/mcp` can use it | Upstream's hardened mode with a bearer token, or a reverse proxy with auth — Tier 2 |
+| **Engine statistics pages are on** | `enable_metrics: true` collects per-engine counters and shows them at `/stats` and `/stats/errors`. Not user data, but extra attack surface. (The Prometheus endpoint `/metrics` is off: `open_metrics` is empty, so it answers 404.) | Disable in `settings.yml` — Tier 2 |
 
 ---
 
@@ -48,13 +53,13 @@ This stack is privacy-respecting in design but is **not anonymous out of the box
 
 These three changes cost almost nothing and close the most common holes. If you change nothing else, do these.
 
-1. **Set a strong `server.secret_key`** in `settings.yml` (random 64-character string). Do not commit this. Generate one with whichever tool you already have installed:
+1. **Set a strong secret key** (random 64-character string) as `SEARXNG_SECRET` in `.env`. Do not commit it. Generate one with whichever tool you already have installed:
    ```powershell
-   # PowerShell (Windows — built in, no install needed)
-   [System.BitConverter]::ToString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).Replace('-','').ToLower()
+   # PowerShell (Windows PowerShell 5.1 and PowerShell 7 — built in, no install needed)
+   $b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
    ```
    ```bash
-   # Node.js (you already have it for the MCP server)
+   # Node.js (if installed)
    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
    # Docker (works on any OS that runs this stack)
@@ -66,24 +71,16 @@ These three changes cost almost nothing and close the most common holes. If you 
    # Python (any platform with Python installed)
    python -c "import secrets; print(secrets.token_hex(32))"
    ```
-   Better still: leave `secret_key` as a placeholder in the file and set the `SEARXNG_SECRET` env var (it overrides the file value), so the secret never lives on disk in a tracked file.
+   Use `.env`, not `settings.yml`: `docker-compose.yml` always passes `SEARXNG_SECRET` into the container, and SearXNG lets it override the file **even when it is empty**, so a key written into `settings.yml` is never used.
 
-2. **Service binding (already localhost-only by default).** The shipped `docker-compose.yml` binds the services to `127.0.0.1`, which means only software running on your own machine can reach them. Nothing extra to do here.
-
-   **If you *want* LAN access** (so other devices on your home network can hit the SearXNG UI or your LLM client can connect from a separate machine), change the bindings to `0.0.0.0`:
-   ```yaml
-   ports:
-     - "0.0.0.0:8888:8080"   # SearXNG — exposes UI to your LAN
-     - "0.0.0.0:3001:3001"   # MCP — exposes endpoint to your LAN
+2. **Service binding.** SearXNG binds to `127.0.0.1` by default (only software on your own machine can reach it). The MCP server binds to `0.0.0.0` by default so remote MCP clients can connect. Both are set from `.env`, so `git pull` never conflicts with your choice:
    ```
-   ⚠️ **The MCP server has no authentication** — anyone on your network who can reach `:3001/mcp` can use it. If you bind to `0.0.0.0`, you should also do **Tier 2** (reverse proxy with auth + host firewall rules) before leaving it running.
-
-3. **Turn on the SearXNG limiter.** In `settings.yml`:
-   ```yaml
-   server:
-     limiter: true
+   SEARXNG_BIND=127.0.0.1   # 0.0.0.0 exposes the SearXNG UI to your LAN
+   MCP_BIND=127.0.0.1       # restrict the MCP endpoint to this machine
    ```
-   Throttles anyone who tries to abuse the instance.
+   ⚠️ **The MCP server has no authentication by default** — anyone on your network who can reach `:3001/mcp` can use it. If it binds to `0.0.0.0`, also do **Tier 2** (authentication + host firewall rules) before leaving it running.
+
+3. **Only if others can reach SearXNG: the limiter, which needs extra setup.** `server: limiter: true` on its own does nothing here: the limiter needs a Valkey database, and this stack has none (SearXNG logs "The limiter requires Valkey" and runs unprotected). To use it, add a Valkey service to `docker-compose.yml`, set `valkey: url: valkey://valkey:6379/0` in `settings.yml`, and add the Docker network to `pass_ip` in `searxng/config/limiter.toml` (for example `pass_ip = ['172.16.0.0/12']`). Without the pass list, the limiter allows only 4 JSON requests per IP per hour, and every MCP search comes from the Docker network.
 
 ---
 
@@ -91,7 +88,17 @@ These three changes cost almost nothing and close the most common holes. If you 
 
 Do these if others share your network or you expose anything beyond localhost.
 
-4. **Add authentication on the MCP endpoint.** The MCP server itself has *no* auth — anyone who can reach `:3001/mcp` can use it. Put a reverse proxy in front of port 3001 with HTTP basic auth, an API token, or mTLS. Easiest options:
+4. **Add authentication on the MCP endpoint.** By default anyone who can reach `:3001/mcp` can use it. Two ways to close that:
+
+   **Upstream's hardened mode** (no extra software). Add to the `mcp-searxng` `environment:` in `docker-compose.yml`:
+   ```yaml
+      - MCP_HTTP_HARDEN=true
+      - MCP_HTTP_AUTH_TOKEN=${MCP_AUTH_TOKEN}          # put a long random value in .env
+      - MCP_HTTP_ALLOWED_HOSTS=localhost:3001,100.x.y.z:3001,mybox.tailnet.ts.net:3001
+   ```
+   and set `MCP_ALLOWED_ORIGINS` in `.env` (hardened mode refuses to start without it). Clients must then send `Authorization: Bearer <token>`. `MCP_HTTP_AUTH_TOKEN` on its own does nothing — the token is only checked when `MCP_HTTP_HARDEN=true`. Hardened mode also turns on DNS-rebinding protection, so every `host:port` clients use to reach the server (LAN IP, Tailscale IP or name) must be in `MCP_HTTP_ALLOWED_HOSTS`, or they get refused.
+
+   **Or a reverse proxy** in front of port 3001 with HTTP basic auth, an API token, or mTLS:
    - [Caddy](https://caddyserver.com/) — single binary, basic auth in ~3 lines of Caddyfile
    - [nginx](https://nginx.org/) — most common, plenty of tutorials
    - [Traefik](https://traefik.io/) — Docker-native, integrates with `docker-compose.yml`
@@ -101,9 +108,9 @@ Do these if others share your network or you expose anything beyond localhost.
    general:
      enable_metrics: false
    ```
-   Removes the `/stats` page (performance counters — not user data, but extra attack surface).
+   Stops collecting engine statistics: `/stats` still loads but shows nothing, its footer link is hidden, and `/stats/errors` returns empty data, so you lose the engine diagnosis described under [Search engines](#search-engines).
 
-6. **Block the ports at your host firewall.** Defense-in-depth — even with localhost binding from Tier 1, also block ports 8888 and 3001 at the OS firewall (Windows Defender Firewall, `ufw` on Linux, macOS Firewall).
+6. **Block the ports at your host firewall.** Defense-in-depth — even with localhost binding from Tier 1, also block ports 8888 and 3001 at the OS firewall (Windows Defender Firewall, macOS Firewall). On Linux, `ufw` rules do **not** apply to ports published by Docker (Docker's iptables rules run first); put the rules in the `DOCKER-USER` iptables chain instead.
 
 ---
 
@@ -120,9 +127,9 @@ Your IP also hidden from upstream search engines. Only do this tier if you need 
    ```
    Then add a Tor service to `docker-compose.yml` (e.g., the [`dperson/torproxy`](https://hub.docker.com/r/dperson/torproxy) image).
 
-8. **Route `web_url_read` through Tor too.** Set `HTTPS_PROXY` and `HTTP_PROXY` env vars on the `mcp-searxng` service in `docker-compose.yml`, pointing at the same Tor/VPN proxy. Otherwise *reading* a URL still leaks your IP to that site, even if *searching* doesn't.
+8. **Route `web_url_read` through Tor too.** Set `URL_READER_HTTPS_PROXY` and `URL_READER_HTTP_PROXY` on the `mcp-searxng` service in `docker-compose.yml` to an **HTTP** proxy that forwards to Tor or your VPN, for example `http://tor:8118` (the Privoxy port of `dperson/torproxy`). The MCP server accepts only `http://` and `https://` proxy URLs; `socks5h://tor:9050` makes every `web_url_read` fail with "Unsupported proxy protocol". Otherwise *reading* a URL still leaks your IP to that site, even if *searching* doesn't. Prefer these over the generic `HTTPS_PROXY`/`HTTP_PROXY`, which also apply to the server's own requests to `http://searxng:8080` unless you add `NO_PROXY=searxng`. With a proxy set, the proxy resolves host names, so the private-address guard refuses only literal private IPs and `localhost` names.
 
-9. **Use a privacy-respecting DNS resolver.** Configure Docker to resolve through `1.1.1.1` (Cloudflare), `9.9.9.9` (Quad9), or a local Unbound resolver. Otherwise your ISP still sees every domain name you look up, even when the connection itself is over Tor.
+9. **Keep DNS away from your ISP.** With `socks5h://` (step 7), SearXNG already resolves engine host names through Tor, and the HTTP proxy from step 8 resolves the names `web_url_read` fetches. Anything else the containers look up still goes to your normal resolver, and plain DNS to `1.1.1.1` or `9.9.9.9` can still be read by your ISP. Use DNS-over-TLS/HTTPS (for example a local Unbound resolver that forwards over TLS) and point Docker at it.
 
 > **The tiers are cumulative — gaps reopen if you skip lower ones.** Tier 3 alone (Tor without the localhost binding from Tier 1) still exposes your instance to anyone on your LAN. Tier 1 alone leaves your IP visible to upstream search engines. For genuine end-to-end privacy, you need all three tiers.
 
@@ -130,38 +137,44 @@ Your IP also hidden from upstream search engines. Only do this tier if you need 
 
 ## Modifying the default settings
 
-The shipped `settings.yml` is **already tuned for this stack** — JSON output enabled, rate limiter off, fast retries on suspended engines, curated set of working engines. You only need to touch this file if you want different defaults. Below is what's already set and how to change each piece.
+`searxng/config/settings.yml` does **not** contain SearXNG's whole configuration. It starts with `use_default_settings: true`, so SearXNG first loads the default `settings.yml` that ships inside the image and then merges ours on top: top-level sections key by key, and each engine entry into the default engine with the same `name`. Only the things this stack changes are in the file, and each one has a comment saying why.
+
+Two consequences:
+- To see a default, or the full list of engines and their options, read the image's file: `docker exec searxng cat /usr/local/searxng/searx/settings.yml`. The effective engine list (enabled state, categories, shortcuts, timeouts) and plugin states are at `http://localhost:8888/config`; other merged values (such as `suspended_times`, `request_timeout` or `outgoing`) are not shown there.
+- The **`plugins:` section replaces** the image's list instead of merging, so it names every plugin. After a SearXNG upgrade, compare it with the image's list.
+
+Below is what the shipped file sets and how to change each piece.
 
 ### JSON output (required by the MCP server)
 
-Already enabled:
 ```yaml
 search:
   formats:
     - html
     - json
 ```
-Don't disable JSON unless you also stop using the MCP server — it's the format the MCP patches parse.
+Don't remove `json` — the MCP server reads results as JSON and gets HTTP 403 without it.
 
 ### Rate limiter
 
-Off by default for local use:
+Off for local use:
 ```yaml
 server:
   limiter: false
 ```
-Set to `true` if you expose the instance beyond your own machine (this is also Tier 1 of the [hardening section](#tier-1--easy-wins-start-here-takes-10-minutes)).
+Setting it to `true` alone does nothing: the limiter needs a Valkey service and `valkey.url`, and with Valkey on it allows only 4 JSON requests per IP per hour unless the Docker network is in `pass_ip` in `limiter.toml` (see Tier 1 of the [hardening section](#tier-1--easy-wins-start-here-takes-10-minutes)). `searxng/config/limiter.toml` only contains comments; it exists so SearXNG does not log a warning about a missing file.
 
 ### Engine suspension times
 
-Tuned for fast recovery — when an engine throws an error, it's only sidelined briefly before being retried:
+When an engine fails, SearXNG sidelines it for a while. The shipped values are deliberately long:
 ```yaml
 search:
   suspended_times:
-    SearxEngineAccessDenied: 30   # seconds
-    SearxEngineCaptcha: 60
-    SearxEngineTooManyRequests: 30
+    SearxEngineAccessDenied: 900     # seconds; "Access denied", HTTP 402/403
+    SearxEngineCaptcha: 1800         # CAPTCHA
+    SearxEngineTooManyRequests: 900  # HTTP 429
 ```
+Short holds (30-60 s) meant blocked engines were retried on almost every query, so each search waited the full timeout on engines that were certain to fail, and the repeated hits kept the instance flagged. Some engines (DuckDuckGo's html endpoint, Qwant) raise their CAPTCHA with a hard-coded zero suspension that overrides these values, which is one reason they are disabled.
 
 ### Request timeout
 
@@ -169,111 +182,56 @@ search:
 outgoing:
   request_timeout: 5.0
 ```
-Bump higher if your network is slow or you keep seeing engine timeouts.
+Keep every per-engine `timeout:` at or below this value. A search waits for the **largest** timeout among the engines it selects, so one engine with `timeout: 10` makes every query in its category wait up to 10 s when that engine is slow. (That is why `crossref` (upstream 30 s) and `gentoo` (upstream 10 s) are overridden to 5.0; `mwmbl` has no upstream timeout and is pinned to 5.0 so it is not raised by accident. Two upstream exceptions remain: `lingva` 6.0, which only fires on `xx-yy word` translation queries, and `wttr.in` 9.0 in the weather category.)
+
+### HTTP/2
+
+```yaml
+outgoing:
+  enable_http2: true
+```
+Since 2026.9.23 SearXNG sends requests through curl_cffi with a Chrome TLS fingerprint. Setting this to `false` forces HTTP/1.1 for every engine, which is a fingerprint no real Chrome sends, and Wikimedia answers it with HTTP 429. (On older images, which used httpx, it had to be `false` for Yahoo and DuckDuckGo.)
 
 ### Search engines
 
-The shipped config enables a curated set that work reliably from a self-hosted Docker instance and disables ones that consistently fail.
+The shipped overrides enable engines that answer self-hosted instances and disable ones that fail from typical residential, VPN or CGNAT addresses. Tested on 2026-09-24:
 
-**Enabled by default**: Bing, Mojeek, Yahoo, Startpage, Presearch, Wiby, Crowdview, Yep, WolframAlpha (general web); plus images/videos/news variants. DuckDuckGo and Brave are also enabled in the shipped config — disable them with `disabled: true` if you start seeing CAPTCHAs or rate-limit errors from your IP.
+**General web, enabled**: Bing, Yahoo, DuckDuckGo web (`duckduckgo web`, not the html `duckduckgo` engine), Google CSE (keyless; from a busy or flagged IP it answers "unusual traffic from your network" and is suspended for 900 s), Yandex, Keenable, Swisscows, mwmbl, findborg (a third-party keyless proxy of Brave's index), and Wikipedia (infoboxes for exact article titles).
 
-**Disabled by default** (`disabled: true`):
-- **Google** web/news/videos/images — persistent 403 from self-hosted IPs
-- **Startpage News** — upstream date-parsing crash
-- **Qwant** — access denied to non-EU/non-residential IPs
-- **Yandex** — CAPTCHA
-- **Wikidata, Mwmbl** — timeouts
+**Disabled because the engine blocks self-hosted IPs** (they fail on the first query from a cold container): Brave (HTTP 429), DuckDuckGo html, Google web, Qwant web and GMX (CAPTCHA), Yep (HTTP 403). Startpage is also off (`inactive: true`): its Anubis proof-of-work difficulty rises for this IP after one query.
 
-### Re-enabling Google (mobile UI)
+**Disabled because broken or unhelpful**: Seznam (times out), Mojeek (works, but lowers relevance; still usable as `!mjk`), Wiby, Crowdview, WolframAlpha (no-API endpoint times out), and in other categories arch linux wiki, bandcamp, kickass, solidtorrents, wikinews, sepiasearch, DuckDuckGo images/news/videos and Qwant images, plus Wikidata, Europe PMC and Google videos (untested or off-topic) and radio browser (not loaded: its server list is empty inside Docker).
 
-Google is disabled because it returns 403 from self-hosted instances. The mobile UI works better than the desktop one if you want to try re-enabling it:
+**Other categories**: images (Bing, Google CSE, Openverse, Flickr, DeviantArt, Pinterest, Wikimedia Commons, Pexels, Unsplash), videos (Bing, YouTube, Qwant, Dailymotion, Vimeo, Wikimedia Commons), news (Bing, Google, Yahoo, Qwant, Reuters), science (Google Scholar, Semantic Scholar, OpenAIRE, arXiv, PubMed, Crossref, PDBe).
+
+Your exit IP decides a lot of this. To try a disabled engine, override it by name:
 ```yaml
-  - name: google
-    engine: google
-    shortcut: go
-    use_mobile_ui: true
-    disabled: false   # change from true
+engines:
+  - name: brave
+    disabled: false
 ```
-Expect intermittent failures even with mobile UI — Bing / Mojeek / Yahoo are more reliable fallbacks.
+then `docker compose restart searxng`, run a few searches, and check `curl -s http://localhost:8888/stats/errors`. An engine that fails on the first query from a freshly started container is blocking your IP; turning more of those on does not help. To try one without changing the file, use its bang in the web UI or `engines=<name>` on the API. An engine set to `inactive: true` (Startpage, radio browser, ahmia, torch) is not loaded at all: set `inactive: false` as well, since its bang and `engines=<name>` do nothing until then.
 
 ---
 
 ## Building from scratch (without cloning)
 
-If you'd rather not clone this repository — for example, you want to understand exactly what each file does, or build it into an existing setup — here are the manual file-creation steps. The default install flow in [Project.md](Project.md) just clones everything; this section reproduces what `git clone` gives you.
+Cloning is the supported path: the stack is the combination of `docker-compose.yml`, `searxng/config/settings.yml` and `limiter.toml`, and the files in `mcp-searxng-patches/`, and they are written for each other (pinned image tags, mounted file names, environment variables). If you would rather assemble it by hand, copy these files from the repository into the same layout:
 
-### 1. Create the project directory
-
-```bash
-mkdir -p ~/searxng-stack
-cd ~/searxng-stack
+```
+your-dir/
+  docker-compose.yml
+  .env                              # SEARXNG_SECRET=..., optional SEARXNG_BIND / MCP_BIND / MCP_ALLOWED_ORIGINS
+  searxng/config/settings.yml
+  searxng/config/limiter.toml
+  searxng/data/                     # empty; SearXNG's cache
+  mcp-searxng-patches/Dockerfile
+  mcp-searxng-patches/index.js
+  mcp-searxng-patches/version.js
+  mcp-searxng-patches/enhanced-search.js
+  mcp-searxng-patches/image-reader.js
 ```
 
-### 2. Create `docker-compose.yml`
+Then follow [README.md](README.md) from **Step 3: Build and Start Everything**.
 
-```yaml
-services:
-  searxng:
-    image: docker.io/searxng/searxng:latest
-    container_name: searxng
-    restart: unless-stopped
-    ports:
-      - "0.0.0.0:8888:8080"
-    volumes:
-      - ./searxng/config:/etc/searxng
-      - ./searxng/data:/var/cache/searxng
-    environment:
-      - SEARXNG_BASE_URL=http://localhost:8888/
-
-  mcp-searxng:
-    build:
-      context: ./mcp-searxng-patches
-      dockerfile: Dockerfile
-    image: mcp-searxng-enhanced:latest
-    container_name: mcp-searxng
-    restart: unless-stopped
-    ports:
-      - "0.0.0.0:3001:3001"
-    volumes:
-      - ./mcp-searxng-patches/index.js:/app/dist/index.js:ro
-      - ./mcp-searxng-patches/types.js:/app/dist/types.js:ro
-      - ./mcp-searxng-patches/search.js:/app/dist/search.js:ro
-      - ./mcp-searxng-patches/url-reader.js:/app/dist/url-reader.js:ro
-    environment:
-      - SEARXNG_URL=http://searxng:8080
-      - MCP_HTTP_PORT=3001
-    depends_on:
-      - searxng
-```
-
-### 3. Create the custom `Dockerfile` for the MCP server
-
-`mcp-searxng-patches/Dockerfile`:
-```dockerfile
-FROM isokoliuk/mcp-searxng:latest
-RUN npm install sharp@0.33.5
-```
-
-This extends the base MCP server image with `sharp` so `web_url_read` can resize images before base64-encoding them.
-
-### 4. Create the SearXNG config directories
-
-```bash
-mkdir -p ~/searxng-stack/searxng/config
-mkdir -p ~/searxng-stack/searxng/data
-mkdir -p ~/searxng-stack/mcp-searxng-patches
-```
-
-### 5. Get the MCP patch files
-
-You still need the four custom JS patch files (`index.js`, `types.js`, `search.js`, `url-reader.js`) in `mcp-searxng-patches/`. The simplest way is to copy them from this repo. They're MIT-licensed and audited (no filesystem/shell access, no telemetry).
-
-### 6. Start SearXNG once to generate the default `settings.yml`
-
-```bash
-cd ~/searxng-stack
-docker compose up -d searxng
-sleep 10
-```
-
-This creates `searxng/config/settings.yml` with the upstream defaults. Now jump back to **Step 2: Configure SearXNG Settings** in [Project.md](Project.md) and proceed normally from there.
+The patch files are MIT-licensed and add no telemetry. Their only process/file access: `image-reader.js` starts its SVG renderer through `/bin/sh` and writes that child's `/proc/<pid>/oom_score_adj`. Do not mount any other files over the MCP image's `dist/` folder: the upstream files that are not listed above (URL security, HTTP security, PDF reading) must run unmodified.

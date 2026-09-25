@@ -65,8 +65,7 @@ A self-hosted SearXNG metasearch engine paired with the `mcp-searxng` MCP server
 > **Quick note on privacy before you start.** This stack runs entirely on your machine and is privacy-respecting by design (no telemetry, no accounts, no third-party trackers), but the defaults are tuned for "just works," not maximum privacy. Before exposing it beyond your own computer, to your LAN, the internet, or anyone else please read **[ADVANCED.md](ADVANCED.md)**
 
 ### Prerequisites
-- Docker and Docker Compose must be installed
-- Node.js >= 20 must be installed
+- Docker and Docker Compose must be installed (Node.js is **not** needed on the host: the MCP server runs inside its Docker image)
 
 ### Step 1: Clone the Repository
 
@@ -81,35 +80,28 @@ This gives you the `docker-compose.yml`, the SearXNG `settings.yml`, the MCP pat
 
 ### Step 2: Configure SearXNG Settings
 
-The shipped `searxng/config/settings.yml` is **already preconfigured** for this stack — JSON output enabled, rate limiter off, fast engine retries, a curated set of engines, and engine suspension times tuned so a blocked engine is not retried on every single query. The only thing you need to touch here is the `secret_key`.
+The shipped `searxng/config/settings.yml` is **already preconfigured** for this stack — JSON output enabled, rate limiter off, a curated set of engines that answer self-hosted instances, and long engine suspension times so a blocked engine is not retried on every single query. It only holds overrides: SearXNG merges it over the default settings inside the (pinned) image. The only thing you need to set is the secret key.
 
 > Want to change which engines are enabled, the request timeout, or any other SearXNG default? See [**Modifying the default settings**](ADVANCED.md#modifying-the-default-settings) in ADVANCED.md.
 
 #### Set the `secret_key` (or use the env var)
 
-The shipped `settings.yml` has a placeholder `secret_key: "CHANGE_ME_BEFORE_RUNNING"`. SearXNG **will start** with the placeholder, so for a localhost-only personal instance you can leave it and come back to this later. **But** if you ever bind to `0.0.0.0`, expose this to your LAN, or share it with anyone, generate a real one — otherwise an attacker can forge image-proxy and CSRF tokens against your instance.
+SearXNG **will start** without a key, so for a localhost-only personal instance you can come back to this later. **But** if you ever bind to `0.0.0.0`, expose this to your LAN, or share it with anyone, set a real one — otherwise anyone can forge the HMAC that SearXNG's `/image_proxy` endpoint checks and use your instance as an open image proxy.
 
-Two ways to set it (pick one):
-
-**Option A — env var (recommended):**
-
-Create a `.env` file next to `docker-compose.yml`:
+Set it in a `.env` file next to `docker-compose.yml`:
 ```
 SEARXNG_SECRET=<paste your generated 64-char hex string here>
 ```
-The env var overrides whatever is in `settings.yml`, so the placeholder can stay in the tracked file forever.
 
-**Option B — edit `settings.yml` directly:**
-
-Replace the placeholder with your generated key. If you do this, make sure not to leak your `settings.yml`.
+`docker-compose.yml` always passes `SEARXNG_SECRET` into the container, and SearXNG lets that variable override `settings.yml` **even when it is empty**. So the `secret_key: "CHANGE_ME_BEFORE_RUNNING"` placeholder in `settings.yml` is never used, and editing it has no effect — without a `.env` value the instance runs with an empty key. Use `.env` (it is gitignored, so the key never reaches the repo).
 
 **Generate a key with whichever tool you have installed:**
 ```powershell
-# PowerShell (Windows — built in)
-[System.BitConverter]::ToString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).Replace('-','').ToLower()
+# PowerShell (Windows PowerShell 5.1 and PowerShell 7 — built in)
+$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
 ```
 ```bash
-# Node.js (already installed for the MCP server)
+# Node.js (if you have it)
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 # Docker (works anywhere this stack does)
@@ -138,7 +130,7 @@ Health check:
 curl -s http://localhost:3001/health
 ```
 
-Expected: `{"status":"healthy","server":"ihor-sokoliuk/mcp-searxng","version":"0.9.2-enhanced","transport":"http"}`
+Expected: `{"status":"healthy","server":"ihor-sokoliuk/mcp-searxng","version":"2.4.0-enhanced","transport":"http"}`
 
 Test search:
 ```bash
@@ -147,7 +139,7 @@ curl -s "http://localhost:8888/search?q=test&format=json" | head -c 200
 
 ### Step 5 (only if accessing from another machine): Open the bindings to your LAN / Tailscale
 
-By default the shipped `docker-compose.yml` binds the services to **`127.0.0.1`** — reachable only from the machine running Docker. If you want another device on your LAN, your Tailscale tailnet, or anywhere else off-host to reach the SearXNG UI or the MCP endpoint, you have to change the bindings to **`0.0.0.0`**.
+By default the shipped `docker-compose.yml` binds SearXNG to **`127.0.0.1`** (this machine only) and the MCP server to **`0.0.0.0`** (already reachable from your LAN / Tailscale tailnet). Both come from `.env`: `SEARXNG_BIND` (default `127.0.0.1`) and `MCP_BIND` (default `0.0.0.0`).
 
 Quick diagnostic to spot this:
 
@@ -162,20 +154,14 @@ Look at the **PORTS** column. If you see:
 | `0.0.0.0:8888->8080/tcp` | Reachable from anywhere on the network ✓ |
 | `127.0.0.1:8888->8080/tcp` | **Localhost only** — the *exact* symptom that makes external access "time out" |
 
-If both rows show `127.0.0.1:` (or one does and one doesn't, like SearXNG locked down while MCP is open), edit `docker-compose.yml` and change the binding(s):
+If a row shows `127.0.0.1:` and you need it reachable off-host, set the binding in `.env` (next to `docker-compose.yml`). Do not edit `docker-compose.yml` itself: `.env` is gitignored, so `git pull` never conflicts with your choice.
 
-```yaml
-services:
-  searxng:
-    ports:
-      - "0.0.0.0:8888:8080"   # was 127.0.0.1:8888:8080
-
-  mcp-searxng:
-    ports:
-      - "0.0.0.0:3001:3001"   # was 127.0.0.1:3001:3001
+```
+SEARXNG_BIND=0.0.0.0   # default 127.0.0.1
+MCP_BIND=0.0.0.0       # already the default; 127.0.0.1 keeps the MCP endpoint on this machine
 ```
 
-Then a **full down + up** is required (port changes don't apply on a plain `restart`):
+Then recreate the containers (port changes don't apply on a plain `restart`):
 
 ```cmd
 docker compose down
@@ -183,7 +169,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Both rows should now show `0.0.0.0:...`.
+The changed rows should now show `0.0.0.0:...`.
 
 If `docker compose ps` already shows `0.0.0.0` and external access *still* fails, it's the OS firewall. On Windows, allow the ports from an admin PowerShell:
 
@@ -192,7 +178,9 @@ New-NetFirewallRule -DisplayName "MCP SearXNG (8888)" -Direction Inbound -Protoc
 New-NetFirewallRule -DisplayName "MCP Server (3001)"   -Direction Inbound -Protocol TCP -LocalPort 3001 -Action Allow
 ```
 
-> **Security note**: switching to `0.0.0.0` exposes the services to anyone who can reach your machine on those ports. The MCP server has no authentication. If you're going beyond a trusted home/Tailscale network, read [ADVANCED.md → Tier 2](ADVANCED.md#tier-2--network-hardening) for adding a reverse proxy with auth.
+**Browser-based MCP clients** (anything that sends an `Origin` header, such as a web UI or the MCP Inspector) are refused with HTTP 403 unless their origin is listed. Add the exact origins, with scheme and port, to `.env`, e.g. `MCP_ALLOWED_ORIGINS=http://localhost:3001,http://100.x.y.z:3001`. The list replaces the localhost default, so include those too if you need them. Clients that send no `Origin` (Claude Code, SDK clients, LM Studio, curl) are not affected.
+
+> **Security note**: `0.0.0.0` exposes a service to anyone who can reach your machine on that port, and the MCP server is bound to `0.0.0.0` by default (set `MCP_BIND=127.0.0.1` in `.env` to keep it local). The MCP server has no authentication by default. Upstream can require a static bearer token in its hardened mode, or OAuth access tokens; if you're going beyond a trusted home/Tailscale network, read [ADVANCED.md → Tier 2](ADVANCED.md#tier-2--network-hardening).
 
 ## Endpoints Summary
 
@@ -208,21 +196,27 @@ New-NetFirewallRule -DisplayName "MCP Server (3001)"   -Direction Inbound -Proto
 ## MCP Tools
 
 ### 1. searxng_web_search
-Web search with category, pagination, and filtering support.
+Web search with category, pagination, and filtering support. Returns structured JSON: `results` (title, url, description, published date, source `engines`, `score`), `suggestions`, `corrections`, `answers`, `infoboxes`, `unresponsive_engines`, `engine_coverage` (`answered` engines and `failed_count`) and `pagination`.
+
+Separate queries with ` | ` to run several searches in one call (`"CFM LEAP engine | A320neo sharklet"`) -- up to 10, two at a time.
 
 | Parameter    | Type   | Description |
 |-------------|--------|-------------|
-| `query`      | string | Search query (required) |
-| `categories` | string | `general`, `images`, `videos`, `news`, `music`, `files`, `it`, `science`, `social media`, `map` |
-| `max_results`| number | Results per batch (default: 20 general, 10 images/videos) |
+| `query`      | string | Search query (required). Operators: `"exact phrase"`, `site:`, `filetype:`, `+required -excluded`, `OR` |
+| `categories` | string | `general` (default), `images`, `videos`, `news`, `science`, `music`, `files` (torrents), `it` (developer/IT sites), `social media`; comma-separated for several |
+| `max_results`| number | Results per call, 1-50 (default: 20 general/news, 10 images/videos) |
 | `offset`     | number | Skip N results for pagination (e.g., 10 for results 11-20) |
-| `pageno`     | number | SearXNG page number |
-| `time_range` | string | `day`, `month`, `year` |
-| `language`   | string | Language code (e.g., `en`, `fr`) |
-| `safesearch` | number | `0` (none), `1` (moderate), `2` (strict) |
+| `pageno`     | number | SearXNG page number (a new batch from the engines) |
+| `time_range` | string | `day`, `week`, `month`, `year` |
+| `language`   | string | Language code (e.g., `en`, `fr`); `all` = no filter (default) |
+| `safesearch` | number | `0` (none, default), `1` (moderate), `2` (strict) |
+| `engines`    | string | Comma-separated engine names to use instead of the category's engines (e.g. `bing,yahoo`) |
+| `min_score`  | number | Drop results below this relevance score (0.0-1.0) |
+
+Optional arguments may be `null` or `""`; they are treated as not set.
 
 ### 2. web_url_read
-Fetches and reads URLs. Auto-detects image URLs and returns resized base64 image blocks.
+Reads web pages (as markdown), PDFs (up to 16 MB), and images. Image URLs are detected automatically and returned as resized base64 image blocks.
 
 | Parameter      | Type    | Description |
 |---------------|---------|-------------|
@@ -234,86 +228,62 @@ Fetches and reads URLs. Auto-detects image URLs and returns resized base64 image
 | `paragraphRange`| string | Paragraph range (e.g., `1-5`) |
 | `readHeadings` | boolean | Return headings only |
 
+`web_url_read` refuses private addresses -- localhost, LAN (RFC1918), Tailscale (100.64.0.0/10), link-local, and Docker hostnames -- on the first request and on every redirect. Set `MCP_HTTP_ALLOW_PRIVATE_URLS=true` on the `mcp-searxng` service only if you want it to read internal services.
+
+### 3. searxng_instance_info and searxng_search_suggestions
+From upstream. `searxng_instance_info` lists the instance's categories and engines. `searxng_search_suggestions` returns no query suggestions here, because autocomplete is off in `settings.yml` (the web UI would otherwise send every keystroke to a third-party suggestion service). It only completes SearXNG `!bang` prefixes, e.g. `!bi` → `!bing`.
+
 ## Image Search Flow
-1. `searxng_web_search({query: "sunset", categories: "images"})` → returns image URLs + metadata
-2. Pick an image → `web_url_read({url: "https://example.com/sunset.jpg", detail: "medium"})` → returns resized base64 image
-3. To see more results → `searxng_web_search({query: "sunset", categories: "images", offset: 10})` → results 11-20
+1. `searxng_web_search({query: "sunset", categories: "images"})` -> returns image URLs + metadata
+2. Pick an image -> `web_url_read({url: "https://example.com/sunset.jpg", detail: "medium"})` -> returns resized base64 image
+3. To see more results -> `searxng_web_search({query: "sunset", categories: "images", offset: 10})` -> results 11-20
+
+SVG images are rendered to PNG. Images over 100 megapixels are refused, and at most two raster resizes and two SVG renders run at a time (small JPEG/PNG/GIF/WebP images that need no resize pass straight through).
 
 ## Custom Patch Files
 
-All patches are in `mcp-searxng-patches/` and mounted read-only into the container:
+The MCP server is upstream [mcp-searxng](https://github.com/ihor-sokoliuk/mcp-searxng) 2.4.0 with a few files mounted read-only over its `dist/` folder. Every other upstream file (including its URL security, HTTP security and PDF reading) runs unmodified.
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Extends base image with `sharp` for image resizing |
-| `types.js` | Tool schemas with `categories`, `offset`, `max_results`, `detail` parameters |
-| `search.js` | Category-aware search formatting, offset pagination, image/video result fields |
-| `url-reader.js` | `fetchImage()` with sharp resizing (3 detail presets), base64 MCP image blocks |
-| `index.js` | Tool handler wiring, image URL detection, detail passthrough |
+| `Dockerfile` | Upstream `isokoliuk/mcp-searxng:2.4.0` + `sharp` (image resizing) + DejaVu fonts (text in SVGs) |
+| `index.js` | Upstream file with small edits marked `// ENHANCED:` -- routes search and image reads to the modules below |
+| `version.js` | Reports `2.4.0-enhanced` |
+| `enhanced-search.js` | Structured JSON output, ` | ` multi-query, `engine_coverage`, tool descriptions written for models |
+| `image-reader.js` | Image fetching (with upstream's SSRF guard), sharp resizing with the 3 detail presets, SVG rendering in a memory- and time-limited child process |
 
 ## Updating SearXNG
 
-SearXNG is pinned to `:latest` in `docker-compose.yml`, so updates are pull-and-restart. Config in `searxng/config/settings.yml` is volume-mounted and survives the update.
+SearXNG is **pinned** to a dated tag in `docker-compose.yml` (currently `2026.9.23-3cd69d30e`). `settings.yml` holds only overrides on top of the default settings inside the image, so a new image can quietly enable, disable or remove engines -- which is why updates are a deliberate tag bump rather than a pull of `:latest`.
 
-### Manual update (recommended)
 ```powershell
-cd MCP-WebSearch-SearXNG
-docker compose pull searxng        # grab newest :latest image
-docker compose up -d searxng       # recreate container with new image
-docker compose logs searxng --tail 100   # check for config-schema warnings
-docker image prune -f              # remove the old image
+# 1. Edit docker-compose.yml: set the new tag from https://hub.docker.com/r/searxng/searxng/tags
+docker compose up -d searxng                               # pulls the tag, recreates the container
+docker compose logs searxng --tail 100                     # look for "can't register engine" (unknown settings keys are mostly ignored silently)
+curl.exe -s http://localhost:8888/config > config-new.json # compare categories/engines with the old version
+curl.exe -s http://localhost:8888/stats/errors             # after a few searches: which engines fail
 ```
 
-Major releases occasionally rename keys in `settings.yml` or add required fields. Check the [SearXNG releases page](https://github.com/searxng/searxng/releases) for breaking changes before updating.
+Also compare the `plugins:` list in `settings.yml` with the image's own `/usr/local/searxng/searx/settings.yml`: the overlay replaces the whole plugin list, so a new upstream plugin is not loaded until you add it. SearXNG publishes no GitHub releases; the part after the date in a tag is a commit hash, so review the changes between the two tags at `https://github.com/searxng/searxng/compare/3cd69d30e...<new-hash>`. To roll back, set the old tag again.
 
-### Pin to a specific version (safer / reproducible)
-Replace `:latest` in `docker-compose.yml` with a date-tagged release, e.g.:
-```yaml
-image: docker.io/searxng/searxng:2026.4.15-abc1234
-```
-Updates then become an explicit edit — review release notes, bump tag, `docker compose up -d`.
-
-### Automatic updates
-| Option | Pros | Cons |
-|--------|------|------|
-| **Watchtower** container | Set-and-forget | Silent break on config-schema changes |
-| Scheduled `docker compose pull && up -d` (Task Scheduler or `/schedule` agent) | You control cadence | Same schema-break risk |
-| GitHub release notifications + manual update | Safest | Slowest |
-
-A reasonable middle ground: schedule a weekly job that runs `docker compose pull` and reports whether a new image is available, but does not auto-apply it.
+A reasonable middle ground for staying current: schedule a weekly job that checks Docker Hub for a newer tag and reports it, but does not apply it.
 
 ### Updating the MCP server
-`mcp-searxng` is built locally from `mcp-searxng-patches/Dockerfile` with custom JS patches
-mounted on top. The base image is **pinned** to `isokoliuk/mcp-searxng:1.16.0` — see the
-comment in that Dockerfile before changing it.
-
-After pulling this repo on another machine, or to pick up upstream MCP changes:
+`mcp-searxng` is built locally from `mcp-searxng-patches/Dockerfile`, which is pinned to `isokoliuk/mcp-searxng:2.4.0`. After pulling this repo on another machine, or after changing the Dockerfile:
 
 ```bash
-docker compose build --pull mcp-searxng
+docker compose build mcp-searxng
 docker compose up -d --force-recreate mcp-searxng
+curl -s http://localhost:3001/health        # version must be 2.4.0-enhanced
 ```
 
-`--force-recreate` is not optional. A plain `docker compose up -d` rebuilds the image but
-leaves the existing container running on the **old** image, so the update silently does
-nothing. Symptom: the container crash-loops with
-`ERR_MODULE_NOT_FOUND: Cannot find package '@modelcontextprotocol/sdk'` while SearXNG
-itself keeps working fine.
-
-Confirm the container is actually on a freshly built image — these two ids must match:
+`--force-recreate` is not optional. A plain `docker compose up -d` rebuilds the image but leaves the existing container running on the **old** image, so the update silently does nothing. Confirm the container is on the freshly built image -- these two ids must match:
 
 ```bash
 docker inspect mcp-searxng --format '{{.Image}}' && docker images --no-trunc --format '{{.ID}}' mcp-searxng-enhanced:latest
 ```
 
-And confirm which base it was built on. `sdk` is correct; `core node server` means the
-image is stale and still on the 2.x base:
-
-```bash
-docker run --rm --entrypoint sh mcp-searxng-enhanced:latest -c "ls /app/node_modules/@modelcontextprotocol/"
-```
-
-If upstream renames internal modules or changes function signatures, the volume-mounted JS patches may need to be rebased manually.
+To move to a newer upstream version: bump the `FROM` tag, copy the new `dist/index.js` and `dist/version.js` out of the image (`docker run --rm --entrypoint cat isokoliuk/mcp-searxng:<tag> /app/dist/index.js`), re-apply the `// ENHANCED:` edits, and rebuild. `enhanced-search.js` and `image-reader.js` import upstream modules, so check them against renamed exports.
 
 ## Tested With
 - **Qwen3.6 35B A3B** — runs both `searxng_web_search` (including multi-query and category filters) and `web_url_read` (text + image modes) reliably. Tool selection, parameter inference, and result interpretation all work well with this model.
@@ -321,23 +291,13 @@ If upstream renames internal modules or changes function signatures, the volume-
 ## Notes
 - MCP server uses HTTP Streamable transport (not stdio or SSE-only)
 - SearXNG connects internally via Docker hostname `searxng:8080`
-- All data stays local — no external API keys needed
-- Custom patches are MIT-licensed, audited, no filesystem/shell access, no telemetry
-- Search engines: Bing, Yahoo, mwmbl, Seznam and Wiby are the general-web
-  engines enabled by default, plus Wikipedia and WolframAlpha for direct
-  answers. Brave, DuckDuckGo, Startpage and Mojeek stay configured but are
-  frequently blocked — see below.
-- **If results look thin, it is usually your exit IP, not this stack.** Brave
-  (HTTP 429), DuckDuckGo and Startpage (CAPTCHA), Mojeek (empty result page)
-  and Ecosia (HTTP 403) all reject self-hosted instances on shared or flagged
-  addresses — VPN exits, CGNAT and datacenter ranges are the common causes.
-  Every one of them fails on the very first query from a cold container, so it
-  is not a rate-limiting problem you can tune your way out of. Check what
-  SearXNG reports:
+- No external API keys needed. Queries go from your IP to the search engines; one engine, **findborg**, is a third-party keyless proxy of Brave's index (disable it in `settings.yml` if you do not want that).
+- Custom patches are MIT-licensed and add no telemetry. Their only process/file access: `image-reader.js` starts its SVG renderer through `/bin/sh -c 'ulimit -v … && exec node …'` (with an empty environment) and writes that child's `/proc/<pid>/oom_score_adj`
+- Search engines (general web): Bing, Yahoo, DuckDuckGo (via its web endpoint), Google (via a keyless Custom Search endpoint), Yandex, Keenable, Swisscows, mwmbl and findborg, plus Wikipedia infoboxes. Typically 6-8 of them answer each query, and results that several engines agree on rank first.
+- **If results look thin, check your exit IP first.** Brave (HTTP 429), DuckDuckGo's html endpoint, Google web, Qwant web/images and GMX (CAPTCHA), and Yep (HTTP 403) reject self-hosted instances on shared or flagged addresses -- VPN exits, CGNAT and datacenter ranges are the common causes. They fail on the very first query from a cold container, so it is not a rate-limiting problem you can tune your way out of, and they are disabled in the shipped config. Startpage is off too: its proof-of-work challenge gets harder for your IP after one query. (Qwant News and Qwant Videos still answer and stay enabled.) Check what SearXNG reports:
   ```bash
   curl -s "http://localhost:8888/search?q=test&format=json" | jq .unresponsive_engines
+  curl -s http://localhost:8888/stats/errors
   ```
-  Options, roughly in order of effort: search from a residential IP without a
-  VPN, put the outgoing requests behind proxies (`outgoing.proxies` in
-  `searxng/config/settings.yml`), or supply an API key for an engine that sells
-  one (`braveapi`). Adding more blocked engines does not help.
+  Options, roughly in order of effort: search from a residential IP without a VPN, put the outgoing requests behind proxies (`outgoing.proxies` in `searxng/config/settings.yml`), or supply an API key for an engine that sells one (`braveapi`). Enabling more blocked engines does not help.
+- Some failures are normal and self-limiting: Swisscows refuses some queries with HTTP 450 ("Unavailable For Legal Reasons"), Yahoo refuses bursts of queries for a short time, and Google's Custom Search endpoint answers "unusual traffic from your network" when your exit IP is flagged, sometimes on the first query. SearXNG suspends the engine (15 minutes for Google) and the others carry the search.
