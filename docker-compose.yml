@@ -38,14 +38,64 @@ services:
       # Reachable off-box by default so remote MCP clients can connect. Set
       # MCP_BIND=127.0.0.1 in .env to restrict it to this machine.
       - "${MCP_BIND:-0.0.0.0}:3001:3001"
+    # Image work (sharp resizes, SVG renders in child processes) is bounded in
+    # image-reader.js; this caps the container as a whole so a bad input can
+    # never take memory from the other services on this host.
+    mem_limit: 4g
+    # Without this, Docker adds the same amount again as swap, and the container
+    # thrashes instead of OOM-killing a renderer (they have oom_score_adj 1000).
+    memswap_limit: 4g
     volumes:
+      # Upstream 2.4.0 dist files with small edits marked "// ENHANCED:".
       - ./mcp-searxng-patches/index.js:/app/dist/index.js:ro
-      - ./mcp-searxng-patches/types.js:/app/dist/types.js:ro
-      - ./mcp-searxng-patches/search.js:/app/dist/search.js:ro
-      - ./mcp-searxng-patches/url-reader.js:/app/dist/url-reader.js:ro
-      - ./mcp-searxng-patches/http-server.js:/app/dist/http-server.js:ro
+      - ./mcp-searxng-patches/version.js:/app/dist/version.js:ro
+      # New modules: structured-JSON / multi-query search, and image reading.
+      - ./mcp-searxng-patches/enhanced-search.js:/app/dist/enhanced-search.js:ro
+      - ./mcp-searxng-patches/image-reader.js:/app/dist/image-reader.js:ro
+      # Every other upstream file (search, url-reader, http-server, url-security,
+      # ...) runs unmodified. Do not mount older copies over them.
     environment:
       - SEARXNG_URL=http://searxng:8080
       - MCP_HTTP_PORT=3001
+      # 2.x listens on 127.0.0.1 unless told otherwise, which the published
+      # port cannot reach (empty reply). Host exposure is still set by MCP_BIND.
+      - MCP_HTTP_HOST=0.0.0.0
+      # Requests that carry an Origin header (browser-based clients) must match
+      # an entry in this list exactly (scheme, host and port), or they get 403.
+      # Empty means only http(s)://localhost, 127.0.0.1 and [::1], with no port
+      # or with :3001. Every other browser origin is refused, including other
+      # localhost ports (MCP Inspector direct mode, http://localhost:6274),
+      # https://claude.ai, LAN/Tailscale IPs and "null". A non-empty list
+      # REPLACES those defaults, so repeat the ones you need, e.g. in .env:
+      # MCP_ALLOWED_ORIGINS=http://localhost:3001,http://localhost:6274,http://100.x.y.z:3001
+      # Clients that send no Origin (Claude Code, SDK/Node clients, curl) are
+      # not affected.
+      - MCP_HTTP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
+      # All clients reach the container from the Docker gateway IP, so they
+      # share one rate-limit bucket. Upstream defaults (20 initializes/min,
+      # 300 requests/min, 300 tool calls/min, 16 in flight) are per-user sized.
+      - MCP_RATE_INIT_MAX=300
+      - MCP_RATE_SESSION_MAX=6000
+      - MCP_TOOL_RATE_MAX=1200
+      - MCP_TOOL_MAX_IN_FLIGHT=64
+      # Sessions are freed only when a client closes them; at the cap (default
+      # 1000) new clients get 503 until a restart.
+      - MCP_HTTP_MAX_SESSIONS=10000
+      # Both caches default to 24 h. Keep searches fresh for news and prices,
+      # and re-read pages hourly.
+      - SEARCH_CACHE_TTL_MS=600000
+      - CACHE_TTL_MS=3600000
+      # web_url_read refuses anything over 5 MB by default, which rules out many
+      # PDFs (service bulletins, advisory circulars). 16 MB matches upstream's
+      # fixed PDF ceiling, so raising this further would not help PDFs.
+      - URL_READ_MAX_CONTENT_LENGTH_BYTES=16777216
+      - FETCH_TIMEOUT_MS=20000
+      # SearXNG waits for its slowest engine (some 'it' engines allow 10 s);
+      # the 10 s default here would cut those searches off.
+      - SEARXNG_TIMEOUT_MS=20000
+      # Node's shared worker threads (default 4) run DNS lookups, file reads
+      # and in-process image resizing. With 16, image work cannot starve the
+      # DNS lookup that every web search needs.
+      - UV_THREADPOOL_SIZE=16
     depends_on:
       - searxng

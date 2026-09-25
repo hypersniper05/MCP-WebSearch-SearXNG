@@ -1,54 +1,86 @@
-#!/usr/bin/env node
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, SetLevelRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ReadResourceRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import { WEB_SEARCH_TOOL, READ_URL_TOOL, isSearXNGWebSearchArgs } from "./types.js";
-import { logMessage, setLogLevel } from "./logging.js";
+// ENHANCED: this is upstream mcp-searxng 2.4.0 dist/index.js with small edits, each marked
+// "// ENHANCED:". To upgrade, take the new upstream index.js and re-apply those hunks.
+import { McpServer, ProtocolError, ProtocolErrorCode, ResourceNotFoundError, fromJsonSchema, } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+// Import modularized functionality
+// ENHANCED: WEB_SEARCH_TOOL, READ_URL_TOOL and isSearXNGWebSearchArgs come from our modules
+// (they extend the types.js originals); everything else still comes from types.js.
+import { SUGGESTIONS_TOOL, INSTANCE_INFO_TOOL, LITE_WEB_SEARCH_TOOL, LITE_SUGGESTIONS_TOOL, LITE_INSTANCE_INFO_TOOL, LITE_READ_URL_TOOL, isSearXNGSearchSuggestionsArgs, isSearXNGInstanceInfoArgs, } from "./types.js";
+import { WEB_SEARCH_TOOL, isSearXNGWebSearchArgs, searchArgsProblem, enhancedWebSearch, withEnhancedHelp } from "./enhanced-search.js"; // ENHANCED
+import { READ_URL_TOOL, isImageUrl, isUnsupportedImageMessage, readImageAsContent } from "./image-reader.js"; // ENHANCED
+import { logMessage, markModernServer, runWithModernLog, setLogLevel } from "./logging.js";
 import { performWebSearch } from "./search.js";
-import { fetchAndConvertToMarkdown, fetchImage } from "./url-reader.js";
+import { performSearchSuggestions } from "./suggestions.js";
+import { fetchInstanceInfo } from "./instance-info.js";
+import { fetchAndConvertToMarkdown } from "./url-reader.js";
 import { createConfigResource, createHelpResource } from "./resources.js";
-import { createHttpServer } from "./http-server.js";
-import { validateEnvironment as validateEnv } from "./error-handler.js";
-
-const packageVersion = "0.9.2-enhanced";
-export { packageVersion };
-
-let currentLogLevel = "info";
-
-// Multi-query searches used to fan out with an unbounded Promise.all. Each
-// query hits every engine in the category at once, so N queries meant N
-// simultaneous requests per engine from a single IP -- enough to trip rate
-// limits and exhaust SearXNG's outgoing connection pool, which then surfaces
-// as engine timeouts. Run them a couple at a time instead.
-const MAX_CONCURRENT_QUERIES = 2;
-
-async function mapWithConcurrency(items, limit, fn) {
-    const results = new Array(items.length);
-    let next = 0;
-    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (true) {
-            const i = next++;
-            if (i >= items.length) return;
-            results[i] = await fn(items[i], i);
+import { createHttpServer, resolveBindHost } from "./http-server.js";
+import { getSearxngInstances, redactSearxngInstanceUrl, } from "./searxng-instances.js";
+import { initializeDiagnosticSanitizer, sanitizeDiagnosticText, sanitizeErrorForTransport, } from "./diagnostic-sanitizer.js";
+import { writeDiagnostic } from "./diagnostic-output.js";
+import { parseBoundedInteger, parseStrictInteger } from "./env-int.js";
+import { validateBrowserSolverEnvironment } from "./browser-solver-config.js";
+import { MCPSearXNGError } from "./error-handler.js";
+import { assertSafeOutput } from "./credential-output.js";
+import { packageVersion } from "./version.js";
+export const TOOL_ADMISSION_REJECTION_MESSAGE = "Server busy. Retry later with backoff.";
+/** SDK-neutral, process-local admission state shared by every MCP transport. */
+export class ToolAdmissionController {
+    config;
+    now;
+    windowStartedAt;
+    rateCount = 0;
+    inFlight = 0;
+    constructor(config, now = () => performance.now()) {
+        this.config = config;
+        this.now = now;
+    }
+    admit() {
+        const now = this.now();
+        if (this.windowStartedAt === undefined || now - this.windowStartedAt >= this.config.rateWindowMs) {
+            this.windowStartedAt = now;
+            this.rateCount = 0;
         }
-    });
-    await Promise.all(workers);
-    return results;
-}
-
-// Image extensions for URL detection
-const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico', '.tiff', '.avif'];
-
-function isImageUrl(url) {
-    try {
-        const parsedUrl = new URL(url);
-        const pathname = parsedUrl.pathname.toLowerCase();
-        return IMAGE_EXTENSIONS.some(ext => pathname.endsWith(ext));
-    } catch {
-        return false;
+        if (this.rateCount >= this.config.rateMax) {
+            return { reason: "rate" };
+        }
+        this.rateCount += 1;
+        if (this.inFlight >= this.config.maxInFlight) {
+            return { reason: "concurrency" };
+        }
+        this.inFlight += 1;
+        let released = false;
+        return {
+            release: () => {
+                if (released)
+                    return;
+                released = true;
+                this.inFlight -= 1;
+            },
+        };
     }
 }
-
+const TOOL_ADMISSION_ENV = [
+    ["MCP_TOOL_RATE_WINDOW_MS", "rateWindowMs", 60000, 1000, 2147483647],
+    ["MCP_TOOL_RATE_MAX", "rateMax", 300, 1, 10000],
+    ["MCP_TOOL_MAX_IN_FLIGHT", "maxInFlight", 16, 1, 256],
+];
+export function createToolAdmissionController() {
+    const values = {};
+    for (const [name, property, fallback, minimum, maximum] of TOOL_ADMISSION_ENV) {
+        const parsed = parseBoundedInteger(process.env[name], fallback, minimum, maximum);
+        if (parsed.invalid) {
+            writeDiagnostic("warn", `Ignoring invalid ${name}. Using default ${fallback}.`);
+        }
+        values[property] = parsed.value;
+    }
+    return new ToolAdmissionController({
+        rateWindowMs: values.rateWindowMs,
+        rateMax: values.rateMax,
+        maxInFlight: values.maxInFlight,
+    });
+}
+// Type guard for URL reading args
 export function isWebUrlReadArgs(args) {
     if (typeof args !== "object" ||
         args === null ||
@@ -57,10 +89,17 @@ export function isWebUrlReadArgs(args) {
         return false;
     }
     const urlArgs = args;
+    // ENHANCED: null means "not set" (clients that fill every optional field send null)
+    for (const key of ["startChar", "maxLength", "section", "paragraphRange", "readHeadings", "detail"]) {
+        if (urlArgs[key] === null)
+            delete urlArgs[key];
+    }
+    // Convert empty strings to undefined for optional string parameters
     if (urlArgs.section === "")
         urlArgs.section = undefined;
     if (urlArgs.paragraphRange === "")
         urlArgs.paragraphRange = undefined;
+    // Validate optional parameters
     if (urlArgs.startChar !== undefined && (typeof urlArgs.startChar !== "number" || urlArgs.startChar < 0)) {
         return false;
     }
@@ -76,231 +115,300 @@ export function isWebUrlReadArgs(args) {
     if (urlArgs.readHeadings !== undefined && typeof urlArgs.readHeadings !== "boolean") {
         return false;
     }
+    // ENHANCED: image detail preset (unknown strings fall back to 'medium' in image-reader.js)
+    if (urlArgs.detail !== undefined && urlArgs.detail !== null && typeof urlArgs.detail !== "string") {
+        return false;
+    }
     return true;
 }
-
-// Factory: returns a fresh MCP Server with all handlers wired up.
-// The MCP SDK's StreamableHTTPServerTransport requires a NEW Server instance
-// per HTTP session (otherwise: "Already connected to a transport" error).
-// stdio transport uses a single server, but it goes through the same factory.
-function createMcpServer() {
-    const server = new Server({
+function getFetchTimeoutMs(mcpServer) {
+    const rawValue = process.env.FETCH_TIMEOUT_MS;
+    if (rawValue === undefined || rawValue.trim() === "") {
+        return 10000;
+    }
+    const parsed = parseStrictInteger(rawValue);
+    if (parsed === undefined || parsed <= 0) {
+        logMessage(mcpServer, "warning", `Ignoring invalid FETCH_TIMEOUT_MS="${rawValue}". Expected a positive integer. Using default 10000.`);
+        return 10000;
+    }
+    return parsed;
+}
+function getDefaultUrlReadMaxChars(mcpServer) {
+    const rawValue = process.env.URL_READ_MAX_CHARS;
+    if (rawValue === undefined || rawValue.trim() === "") {
+        return undefined;
+    }
+    const parsed = parseStrictInteger(rawValue);
+    if (parsed === undefined || parsed <= 0) {
+        logMessage(mcpServer, "warning", `Ignoring invalid URL_READ_MAX_CHARS="${rawValue}". Expected a positive integer.`);
+        return undefined;
+    }
+    return parsed;
+}
+function textToolResult(text) {
+    assertSafeOutput(text);
+    return { content: [{ type: "text", text }] };
+}
+function errorToolResult(text) {
+    return { content: [{ type: "text", text }], isError: true };
+}
+function invalidToolArguments(name, args) {
+    const definition = TOOL_DEFINITIONS[name];
+    if (!definition)
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, sanitizeDiagnosticText(`Unknown tool: ${name}`));
+    if (definition.validate(args))
+        return undefined;
+    // ENHANCED: name the offending argument, so a model fixes the call instead of repeating it
+    const reason = definition.describeInvalid?.(args);
+    return reason ? `${definition.invalidArguments}: ${reason}` : definition.invalidArguments;
+}
+async function executeWebSearch(mcpServer, args, signal) {
+    if (!isSearXNGWebSearchArgs(args))
+        throw new Error("Invalid arguments for web search");
+    // ENHANCED: structured JSON + " | " multi-query. An explicit response_format still gets upstream's output.
+    if (args.response_format === undefined)
+        return textToolResult(await enhancedWebSearch(mcpServer, args, signal));
+    return textToolResult(await performWebSearch(mcpServer, args.query, args.pageno, args.time_range, args.language, args.safesearch === undefined ? undefined : Number(args.safesearch), args.min_score, args.num_results, args.categories, args.engines, args.response_format, args.result_detail));
+}
+async function executeSuggestions(mcpServer, args) {
+    if (!isSearXNGSearchSuggestionsArgs(args))
+        throw new Error("Invalid arguments for search suggestions");
+    const suggestions = await performSearchSuggestions(mcpServer, args.query, args.language);
+    return textToolResult(JSON.stringify({ query: args.query, suggestions }, null, 2));
+}
+async function executeInstanceInfo(mcpServer, args) {
+    if (!isSearXNGInstanceInfoArgs(args))
+        throw new Error("Invalid arguments for instance info");
+    return textToolResult(await fetchInstanceInfo(mcpServer, args.includeEngines, args.includeDisabled, args.category, args.refresh));
+}
+async function executeUrlRead(mcpServer, args, signal) {
+    if (!isWebUrlReadArgs(args))
+        throw new Error("Invalid arguments for URL reading");
+    // ENHANCED: image URLs return an image content block (null = not actually an image -> read as a page)
+    const triedImage = isImageUrl(args.url);
+    if (triedImage) {
+        const image = await readImageAsContent(mcpServer, args.url, args.detail, signal);
+        if (image)
+            return image;
+    }
+    const defaultMaxLength = getDefaultUrlReadMaxChars(mcpServer);
+    const text = await fetchAndConvertToMarkdown(mcpServer, args.url, getFetchTimeoutMs(mcpServer), { // ENHANCED: kept, not returned directly
+        startChar: args.startChar,
+        maxLength: args.maxLength ?? defaultMaxLength,
+        section: args.section,
+        paragraphRange: args.paragraphRange,
+        readHeadings: args.readHeadings,
+    }, signal);
+    // ENHANCED: upstream refuses image/* (e.g. image URLs without an extension); retry those as images
+    if (!triedImage && isUnsupportedImageMessage(text)) {
+        const image = await readImageAsContent(mcpServer, args.url, args.detail, signal);
+        if (image)
+            return image;
+    }
+    return textToolResult(text);
+}
+const TOOL_DEFINITIONS = {
+    searxng_web_search: {
+        validate: isSearXNGWebSearchArgs,
+        describeInvalid: searchArgsProblem, // ENHANCED
+        invalidArguments: "Invalid arguments for web search",
+        execute: executeWebSearch,
+    },
+    searxng_search_suggestions: {
+        validate: isSearXNGSearchSuggestionsArgs,
+        invalidArguments: "Invalid arguments for search suggestions",
+        execute: executeSuggestions,
+    },
+    searxng_instance_info: {
+        validate: isSearXNGInstanceInfoArgs,
+        invalidArguments: "Invalid arguments for instance info",
+        execute: executeInstanceInfo,
+    },
+    web_url_read: {
+        validate: isWebUrlReadArgs,
+        invalidArguments: "Invalid arguments for URL reading",
+        execute: executeUrlRead,
+    },
+};
+async function executeTool(mcpServer, name, args, signal) {
+    const definition = TOOL_DEFINITIONS[name];
+    if (!definition)
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, sanitizeDiagnosticText(`Unknown tool: ${name}`));
+    return definition.execute(mcpServer, args, signal);
+}
+function registerMcpTools(mcpServer, modern, callTool) {
+    const useLiteTools = process.env.SEARXNG_LITE_TOOLS === "true";
+    const registerTool = (tool) => {
+        mcpServer.registerTool(tool.name, {
+            description: tool.description,
+            annotations: tool.annotations,
+            inputSchema: fromJsonSchema(tool.inputSchema),
+        }, async (args, context) => {
+            if (modern) {
+                // eslint-disable-next-line @typescript-eslint/no-deprecated -- required compatibility log bridge
+                return runWithModernLog(context.mcpReq.log, () => callTool(tool.name, args, context.mcpReq.signal));
+            }
+            return callTool(tool.name, args, context.mcpReq.signal);
+        });
+    };
+    registerTool(useLiteTools ? LITE_WEB_SEARCH_TOOL : WEB_SEARCH_TOOL);
+    registerTool(useLiteTools ? LITE_SUGGESTIONS_TOOL : SUGGESTIONS_TOOL);
+    registerTool(useLiteTools ? LITE_INSTANCE_INFO_TOOL : INSTANCE_INFO_TOOL);
+    registerTool(useLiteTools ? LITE_READ_URL_TOOL : READ_URL_TOOL);
+    // Keep one wire-level classification boundary for every protocol era. The
+    // SDK still validates the request envelope before invoking this handler;
+    // these guards preserve legacy-compatible argument forms such as numeric
+    // safesearch while returning validation failures as MCP tool results.
+    mcpServer.server.setRequestHandler("tools/call", async (request, context) => {
+        const callback = async () => {
+            const invalidArguments = invalidToolArguments(request.params.name, request.params.arguments);
+            if (invalidArguments)
+                return errorToolResult(invalidArguments);
+            return callTool(request.params.name, request.params.arguments, context.mcpReq.signal);
+        };
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- required compatibility log bridge
+        return modern ? runWithModernLog(context.mcpReq.log, callback) : callback();
+    });
+}
+function registerMcpResources(mcpServer, modern) {
+    const readConfigResource = async (uri, context) => {
+        const callback = async () => {
+            logMessage(mcpServer, "debug", `Handling read_resource request for: ${uri.href}`);
+            return { contents: [{ uri: uri.href, mimeType: "application/json", text: createConfigResource(mcpServer) }] };
+        };
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- required compatibility log bridge
+        return modern ? runWithModernLog(context.mcpReq.log, callback) : callback();
+    };
+    const readHelpResource = async (uri, context) => {
+        const callback = async () => {
+            logMessage(mcpServer, "debug", `Handling read_resource request for: ${uri.href}`);
+            // ENHANCED: upstream's guide describes upstream's search tool; swap in ours
+            return { contents: [{ uri: uri.href, mimeType: "text/markdown", text: withEnhancedHelp(createHelpResource()) }] };
+        };
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- required compatibility log bridge
+        return modern ? runWithModernLog(context.mcpReq.log, callback) : callback();
+    };
+    mcpServer.registerResource("Server Configuration", "config://server-config", { mimeType: "application/json", description: "Current server configuration and environment variables" }, readConfigResource);
+    mcpServer.registerResource("Usage Guide", "help://usage-guide", { mimeType: "text/markdown", description: "How to use the MCP SearXNG server effectively" }, readHelpResource);
+    // Keep the credential-safe unknown-resource contract while delegating known
+    // resources to the same request-scoped callbacks registered with the SDK.
+    mcpServer.server.setRequestHandler("resources/read", async (request, context) => {
+        if (request.params.uri === "config://server-config") {
+            return readConfigResource(new URL(request.params.uri), context);
+        }
+        if (request.params.uri === "help://usage-guide") {
+            return readHelpResource(new URL(request.params.uri), context);
+        }
+        let safeUri;
+        try {
+            const parsed = new URL(request.params.uri);
+            parsed.username = "";
+            parsed.password = "";
+            parsed.search = "";
+            parsed.hash = "";
+            safeUri = sanitizeDiagnosticText(parsed.href);
+        }
+        catch {
+            throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid resource URI");
+        }
+        throw new ResourceNotFoundError(safeUri);
+    });
+    mcpServer.server.setRequestHandler("logging/setLevel", async (request, context) => {
+        const callback = async () => {
+            logMessage(mcpServer, "info", `Setting log level to: ${request.params.level}`);
+            setLogLevel(mcpServer, request.params.level);
+            return {};
+        };
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- required compatibility log bridge
+        return modern ? runWithModernLog(context.mcpReq.log, callback) : callback();
+    });
+}
+/**
+ * Creates and configures a new McpServer with all handlers registered.
+ * Called once per HTTP session, or once for STDIO mode.
+ */
+export function createMcpServer(admissionController, modern = false) {
+    if (!admissionController) {
+        throw new TypeError("Tool admission controller is required");
+    }
+    const mcpServer = new McpServer({
         name: "ihor-sokoliuk/mcp-searxng",
         version: packageVersion,
     }, {
         capabilities: {
             logging: {},
             resources: {},
-            tools: {
-                searxng_web_search: {
-                    description: WEB_SEARCH_TOOL.description,
-                    schema: WEB_SEARCH_TOOL.inputSchema,
-                },
-                web_url_read: {
-                    description: READ_URL_TOOL.description,
-                    schema: READ_URL_TOOL.inputSchema,
-                },
-            },
+            tools: {},
         },
     });
-
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
-        logMessage(server, "debug", "Handling list_tools request");
-        return {
-            tools: [WEB_SEARCH_TOOL, READ_URL_TOOL],
-        };
-    });
-
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
-        logMessage(server, "debug", `Handling call_tool request: ${name}`);
+    if (modern)
+        markModernServer(mcpServer);
+    const callTool = async (name, args, signal) => {
         try {
-            if (name === "searxng_web_search") {
-                if (!isSearXNGWebSearchArgs(args)) {
-                    throw new Error("Invalid arguments for web search");
-                }
-
-                // Support multiple queries separated by " | "
-                const queries = args.query.includes(' | ')
-                    ? args.query.split(' | ').map(q => q.trim()).filter(q => q.length > 0)
-                    : [args.query];
-
-                if (queries.length === 1) {
-                    // Single query — return directly
-                    const result = await performWebSearch(server, queries[0], args.pageno, args.time_range, args.language, args.safesearch, args.categories, args.max_results, args.offset);
-                    return {
-                        content: [{ type: "text", text: result }],
-                    };
-                }
-
-                // Multiple queries — run a few at a time and combine
-                const results = await mapWithConcurrency(queries, MAX_CONCURRENT_QUERIES, q =>
-                    performWebSearch(server, q, args.pageno, args.time_range, args.language, args.safesearch, args.categories, args.max_results, args.offset)
-                );
-                const combined = {
-                    multi_query: true,
-                    queries: queries,
-                    results: queries.map((q, i) => ({
-                        query: q,
-                        ...JSON.parse(results[i]),
-                    })),
-                };
-                return {
-                    content: [{ type: "text", text: JSON.stringify(combined, null, 2) }],
-                };
+            const admission = admissionController.admit();
+            if (!admission.release)
+                return errorToolResult(TOOL_ADMISSION_REJECTION_MESSAGE);
+            try {
+                logMessage(mcpServer, "debug", `Handling call_tool request: ${name}`);
+                return await executeTool(mcpServer, name, args, signal);
             }
-            else if (name === "web_url_read") {
-                if (!isWebUrlReadArgs(args)) {
-                    throw new Error("Invalid arguments for URL reading");
-                }
-
-                // Check if URL points to an image
-                if (isImageUrl(args.url)) {
-                    const detail = args.detail || 'medium';
-                    logMessage(server, "info", `Detected image URL, fetching as base64 (detail: ${detail}): ${args.url}`);
-                    const imageResult = await fetchImage(server, args.url, 15000, detail);
-
-                    const dimInfo = imageResult.originalWidth && (imageResult.originalWidth !== imageResult.width || imageResult.originalHeight !== imageResult.height)
-                        ? `Original: ${imageResult.originalWidth}x${imageResult.originalHeight} → Resized: ${imageResult.width}x${imageResult.height}`
-                        : `Dimensions: ${imageResult.width || '?'}x${imageResult.height || '?'}`;
-
-                    return {
-                        content: [
-                            {
-                                type: "image",
-                                data: imageResult.base64,
-                                mimeType: imageResult.mimeType,
-                            },
-                            {
-                                type: "text",
-                                text: `Image loaded: ${args.url}\n${dimInfo}\nSize: ${(imageResult.size / 1024).toFixed(1)}KB\nType: ${imageResult.mimeType}\nDetail: ${detail}`,
-                            },
-                        ],
-                    };
-                }
-
-                // Regular URL: fetch as markdown
-                const paginationOptions = {
-                    startChar: args.startChar,
-                    maxLength: args.maxLength,
-                    section: args.section,
-                    paragraphRange: args.paragraphRange,
-                    readHeadings: args.readHeadings,
-                };
-                const result = await fetchAndConvertToMarkdown(server, args.url, 10000, paginationOptions);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: result,
-                        },
-                    ],
-                };
-            }
-            else {
-                throw new Error(`Unknown tool: ${name}`);
+            finally {
+                admission.release();
             }
         }
         catch (error) {
-            logMessage(server, "error", `Tool execution error: ${error instanceof Error ? error.message : String(error)}`, {
+            if (signal?.aborted
+                && (error === signal.reason || (error instanceof Error && error.name === "AbortError"))) {
+                throw error;
+            }
+            if (error instanceof ProtocolError)
+                throw error;
+            const safeError = sanitizeErrorForTransport(error);
+            logMessage(mcpServer, "error", `Tool execution error: ${safeError.message}`, {
                 tool: name,
                 args: args,
-                error: error instanceof Error ? error.stack : String(error)
+                error: safeError.stack,
             });
-            throw error;
+            if (error instanceof MCPSearXNGError && error.expected) {
+                return errorToolResult(safeError.message);
+            }
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Internal server error");
         }
-    });
-
-    server.setRequestHandler(SetLevelRequestSchema, async (request) => {
-        const { level } = request.params;
-        logMessage(server, "info", `Setting log level to: ${level}`);
-        currentLogLevel = level;
-        setLogLevel(level);
-        return {};
-    });
-
-    server.setRequestHandler(ListResourcesRequestSchema, async () => {
-        logMessage(server, "debug", "Handling list_resources request");
-        return {
-            resources: [
-                {
-                    uri: "config://server-config",
-                    mimeType: "application/json",
-                    name: "Server Configuration",
-                    description: "Current server configuration and environment variables"
-                },
-                {
-                    uri: "help://usage-guide",
-                    mimeType: "text/markdown",
-                    name: "Usage Guide",
-                    description: "How to use the MCP SearXNG server effectively"
-                }
-            ]
-        };
-    });
-
-    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-        logMessage(server, "debug", "Handling list_resource_templates request");
-        return { resourceTemplates: [] };
-    });
-
-    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-        const { uri } = request.params;
-        logMessage(server, "debug", `Handling read_resource request for: ${uri}`);
-        switch (uri) {
-            case "config://server-config":
-                return {
-                    contents: [
-                        {
-                            uri: uri,
-                            mimeType: "application/json",
-                            text: createConfigResource()
-                        }
-                    ]
-                };
-            case "help://usage-guide":
-                return {
-                    contents: [
-                        {
-                            uri: uri,
-                            mimeType: "text/markdown",
-                            text: createHelpResource()
-                        }
-                    ]
-                };
-            default:
-                throw new Error(`Unknown resource: ${uri}`);
-        }
-    });
-
-    return server;
+    };
+    registerMcpTools(mcpServer, modern, callTool);
+    registerMcpResources(mcpServer, modern);
+    return mcpServer;
 }
-
+// Main function
 export async function main() {
-    const validationError = validateEnv();
-    if (validationError) {
-        console.error(`\u274C ${validationError}`);
-        process.exit(1);
+    initializeDiagnosticSanitizer();
+    const toolAdmissionController = createToolAdmissionController();
+    const browserSolverIssue = validateBrowserSolverEnvironment();
+    if (browserSolverIssue) {
+        throw new Error(browserSolverIssue);
     }
+    // Check for HTTP transport mode
     const httpPort = process.env.MCP_HTTP_PORT;
     if (httpPort) {
-        const port = parseInt(httpPort, 10);
-        if (isNaN(port) || port < 1 || port > 65535) {
-            console.error(`Invalid HTTP port: ${httpPort}. Must be between 1-65535.`);
+        const port = parseStrictInteger(httpPort);
+        if (port === undefined || port < 1 || port > 65535) {
+            writeDiagnostic("error", `Invalid HTTP port: ${httpPort}. Must be between 1-65535.`);
             process.exit(1);
         }
-        console.log(`Starting HTTP transport on port ${port}`);
-        // Pass the FACTORY (not an instance) \u2014 http-server.js calls it per session.
-        const app = await createHttpServer(createMcpServer);
-        const httpServer = app.listen(port, () => {
-            console.log(`HTTP server listening on port ${port}`);
-            console.log(`Health check: http://localhost:${port}/health`);
-            console.log(`MCP endpoint: http://localhost:${port}/mcp`);
+        const host = resolveBindHost(process.env.MCP_HTTP_HOST);
+        writeDiagnostic("log", `Starting HTTP transport on ${host}:${port}`);
+        const app = await createHttpServer((modern) => createMcpServer(toolAdmissionController, modern), port);
+        const httpServer = app.listen(port, host, () => {
+            writeDiagnostic("log", `HTTP server listening on ${host}:${port}`);
+            // Health/MCP URLs shown as localhost for developer convenience
+            writeDiagnostic("log", `Health check: http://localhost:${port}/health`);
+            writeDiagnostic("log", `MCP endpoint: http://localhost:${port}/mcp`);
         });
+        // Handle graceful shutdown
         const shutdown = (signal) => {
-            console.log(`Received ${signal}. Shutting down HTTP server...`);
+            writeDiagnostic("log", `Received ${signal}. Shutting down HTTP server...`);
             httpServer.close(() => {
-                console.log("HTTP server closed");
+                writeDiagnostic("log", "HTTP server closed");
                 process.exit(0);
             });
         };
@@ -308,31 +416,29 @@ export async function main() {
         process.on('SIGTERM', () => shutdown('SIGTERM'));
     }
     else {
+        // Keep connection setup diagnostics on stderr, including non-TTY clients.
         if (process.stdin.isTTY) {
-            console.error(`\uD83D\uDD0D MCP SearXNG Server v${packageVersion} - Ready`);
-            console.error("\u2705 Configuration valid");
-            console.error(`\uD83C\uDF10 SearXNG URL: ${process.env.SEARXNG_URL}`);
-            console.error("\uD83D\uDCE1 Waiting for MCP client connection via STDIO...\n");
+            writeDiagnostic("error", `🔍 MCP SearXNG Server v${packageVersion} - Ready`);
+            const searxngInstances = getSearxngInstances();
+            if (searxngInstances.length > 0) {
+                writeDiagnostic("error", `🌐 SearXNG URLs: ${searxngInstances.map(redactSearxngInstanceUrl).join("; ")}`);
+            }
+            else {
+                writeDiagnostic("error", "⚠️  SEARXNG_URL not set — configure it before using search tools");
+            }
+            writeDiagnostic("error", "📡 Waiting for MCP client connection via STDIO...\n");
         }
-        const server = createMcpServer();
-        const transport = new StdioServerTransport();
-        await server.connect(transport);
-        logMessage(server, "info", `MCP SearXNG Server v${packageVersion} connected via STDIO`);
-        logMessage(server, "info", `Log level: ${currentLogLevel}`);
-        logMessage(server, "info", `Environment: ${process.env.NODE_ENV || 'development'}`);
-        logMessage(server, "info", `SearXNG URL: ${process.env.SEARXNG_URL || 'not configured'}`);
+        else {
+            const searxngInstances = getSearxngInstances();
+            if (searxngInstances.length > 0) {
+                writeDiagnostic("error", `SearXNG URLs: ${searxngInstances.map(redactSearxngInstanceUrl).join("; ")}`);
+            }
+            else {
+                writeDiagnostic("error", "SEARXNG_URL not set");
+            }
+        }
+        serveStdio((context) => createMcpServer(toolAdmissionController, context.era === "modern"), {
+            onerror: (error) => writeDiagnostic("error", sanitizeErrorForTransport(error)),
+        });
     }
 }
-
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    process.exit(1);
-});
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    process.exit(1);
-});
-
-// dist/cli.js is the image entrypoint: it imports this module and calls
-// main() itself. Invoking main() here as well would start the server twice
-// and fail with "Already connected to a transport", so it is only exported.
